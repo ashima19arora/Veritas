@@ -1,6 +1,6 @@
-# VERITAS — Offline Multi-Agent Research & Fact-Verification System
+# VERITAS
 
-Secure offline multi-agent research system powered by Ollama.
+Secure offline multi-agent research & Fact-Verification system powered by Ollama.
 Every answer is researched, independently verified, checked for contradictions, and cited — before you ever see it.
 
 **Veritas** is Latin for _truth_. That's the whole premise of this project: an AI system that doesn't just answer confidently, but actually checks whether it's earned the right to.
@@ -9,7 +9,7 @@ Every answer is researched, independently verified, checked for contradictions, 
 
 ## Built for
 
-Innova Hack Chapter-1 — Domain 3 (Gen AI), Problem Statement 1
+Innova Hack Chapter-1 — Domain 3 (Gen AI), Problem Statement 1 — Team Compil(h)er
 
 > Generative AI tools are powerful researchers but often struggle with hallucination and unverified claims. A system where multiple AI agents check and challenge each other can produce far more trustworthy output than a single model working alone.
 >
@@ -75,6 +75,11 @@ No single stage's output is final until something else has checked it.
 
 ## How to run
 
+### Prerequisites
+
+- **Ollama** installed and running on your machine, with at least one model pulled (e.g. `ollama pull gemma3:4b`)
+- **Docker Desktop** installed, if using Option A. On Windows, Docker Desktop requires **WSL2** (Windows Subsystem for Linux) — if you haven't set this up before, Docker Desktop will prompt you to enable it on first install, or see [Microsoft's WSL2 install guide](https://learn.microsoft.com/en-us/windows/wsl/install). Make sure Docker Desktop is fully started (not just launching) before proceeding.
+
 ### Option A — Docker (recommended)
 
 **A1. Build the image yourself:**
@@ -84,7 +89,7 @@ docker build -t veritas .
 docker run -p 8501:8501 veritas
 ```
 
-**A2. Or load the pre-built image** (if you were given a `.tar` file instead of the source):
+**A2. Or load the pre-built image** — a `veritas.tar` file is included in this repository, so no build step is needed:
 
 ```bash
 docker load -i veritas.tar
@@ -106,7 +111,7 @@ ollama pull gemma3:4b
 streamlit run streamlit_app.py
 ```
 
-Embedding model weights should be placed in a local `models/` folder (see `requirements.txt` for the exact folder names expected) so the app runs fully offline from the first launch, with no download step.
+A `models/` folder with the embedding weights already downloaded is included in this repository — no separate download step needed, the app runs fully offline from the first launch.
 
 ---
 
@@ -114,7 +119,6 @@ Embedding model weights should be placed in a local `models/` folder (see `requi
 
 - Response time scales with the number of pipeline stages and the size of the chosen models — a full multi-stage answer on larger models can take noticeably longer than a single-pass system.
 - Vector engine support currently covers FAISS and Chroma. A third engine (Qdrant) was evaluated but dropped — its local-file locking proved too fragile to fully stabilize, so it was left out rather than shipped unreliable.
-- Comparison-style questions across many documents at once retrieve broadly, which can occasionally surface less-relevant source chunks alongside the useful ones.
 
 ---
 
@@ -124,3 +128,7 @@ Embedding model weights should be placed in a local `models/` folder (see `requi
 - **Multi-agent as callable services** — extending the four current roles (Researcher, Verifier, Contradiction Checker, Synthesizer) into independently callable agents, moving the architecture further in an agentic-AI direction rather than a single sequential pipeline.
 - **Additional specialized modes** — task-specific pipelines beyond general Q&A and document comparison, built for distinct use cases rather than duplicating existing functionality.
 - **Desktop quick-access app** — a lightweight version triggerable by a global hotkey, for instant access without keeping a browser tab open.
+
+---
+
+**Team:** Compil(h)er
