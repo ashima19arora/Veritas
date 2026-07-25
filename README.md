@@ -47,7 +47,7 @@ No single stage's output is final until something else has checked it.
 ## Tech stack
 
 - **LLM inference:** Ollama (fully local — Gemma 3, Phi-3, or Llama 3.2, selectable)
-- **Embeddings:** bge-small-en-v1.5 / bge-large-en-v1.5 / all-MiniLM-L6-v2 (selectable, local weights)
+- **Embeddings:** bge-small-en-v1.5 / all-MiniLM-L6-v2 (selectable, local weights)
 - **Vector search:** FAISS / Chroma (selectable, both pre-built together)
 - **Reranking:** FlashRank cross-encoder
 - **Orchestration:** LangChain

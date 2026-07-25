@@ -11,6 +11,8 @@ except ImportError:
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["FAISS_NO_AVX2"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"          # never let HuggingFace Hub attempt a network call
+os.environ["TRANSFORMERS_OFFLINE"] = "1"    # same, for the transformers library specifically
 
 import logging
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -34,7 +36,6 @@ from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, Te
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS, Chroma
-from langchain_qdrant import QdrantVectorStore
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -46,7 +47,7 @@ from flashrank import Ranker, RerankRequest
 # ---------------------------------------------------------------------------
 DOCS_DIR       = "docs"
 VECTOR_DB_ROOT = "vectorstore_index"
-ALL_MODELS     = ["bge-small-en-v1.5", "bge-large-en-v1.5", "all-MiniLM-L6-v2"]
+ALL_MODELS     = ["bge-small-en-v1.5", "all-MiniLM-L6-v2"]   # bge-large dropped — CPU spikes too hard for a live demo
 ALL_ENGINES    = ["FAISS", "Chroma"]   # Qdrant dropped — persistent local-mode file-lock issues, not worth the remaining risk this close to deadline
 DEFAULT_EMBED_MODEL = "bge-small-en-v1.5"
 DEFAULT_ENGINE = "FAISS"
@@ -64,6 +65,17 @@ def get_isolated_paths(model_folder):
         "chroma_file": os.path.join(base, "chroma", "chroma.sqlite3"),
         "qdrant":      os.path.join(base, "qdrant"),
     }
+
+def current_index_exists(engine, model_folder):
+    """Cheap file-existence check for the CURRENTLY SELECTED engine+model combo —
+    no embedding model load needed, just used to decide whether the chat input
+    should even be enabled. Fast enough to call on every rerun."""
+    paths = get_isolated_paths(model_folder)
+    if engine == "FAISS":
+        return os.path.exists(paths["faiss_file"])
+    if engine == "Chroma":
+        return os.path.exists(paths["chroma_file"])
+    return False
 
 os.makedirs(DOCS_DIR, exist_ok=True)
 
@@ -265,6 +277,15 @@ def load_vectorstore(engine, model_folder):
     re-runs the whole script top-to-bottom on every interaction, silently resetting any
     ordinary global variable). Cached separately per (engine, model_folder) combination."""
     paths = get_isolated_paths(model_folder)
+
+    # No index built yet (no documents uploaded) — return None quietly.
+    # The caller already shows a clean "No index built yet" message for this case;
+    # don't let a missing-file exception surface as a raw, confusing error instead.
+    if engine == "FAISS" and not os.path.exists(paths["faiss_file"]):
+        return None
+    if engine == "Chroma" and not os.path.exists(paths["chroma_file"]):
+        return None
+
     embeddings = get_embeddings(model_folder)
     try:
         if engine == "FAISS":
@@ -272,9 +293,8 @@ def load_vectorstore(engine, model_folder):
         elif engine == "Chroma":
             store = Chroma(persist_directory=paths["chroma"], embedding_function=embeddings)
         else:
-            from qdrant_client import QdrantClient as _QdrantClient
-            _client = _QdrantClient(path=paths["qdrant"])
-            store = QdrantVectorStore(client=_client, collection_name="rag_docs", embedding=embeddings)
+            st.error(f"Unknown vector engine: {engine}")
+            return None
     except Exception as e:
         st.error(f"Could not load {engine} index for {model_folder}: {e}. Click Rebuild.")
         return None
@@ -288,8 +308,12 @@ def load_vectorstore(engine, model_folder):
 
 @st.cache_resource
 def get_flashrank_engine():
-    """Tiny local cross-encoder — re-scores candidates by true semantic relevance, not just vector distance."""
-    return Ranker()
+    """Tiny local cross-encoder — re-scores candidates by true semantic relevance, not just vector distance.
+    Points at a local cache_dir so it never tries to download from the internet at runtime —
+    critical for actually being offline, not just claiming to be. Run once with internet access
+    to populate this folder (FlashRank auto-downloads into it on first call), then it's reused
+    from disk every time after, fully offline."""
+    return Ranker(cache_dir="models/flashrank")
 
 def retrieve_chunks(vectorstore, query, k=15, top_n=6):
     """Two-stage retrieval, matches VEDA exactly: bi-encoder search (k=15 candidates)
@@ -755,7 +779,7 @@ for message in st.session_state.messages:
                 st.caption(
                     f"{message['latency']:.2f}s | LLM: {message['engine']} | "
                     f"Embed: {message.get('embed', st.session_state.embed_model)} | "
-                    f"Engine: {message.get("vector_engine", st.session_state.vector_engine)} + FlashRank | "
+                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)} + FlashRank | "
                     f"Correctly declined — no relevant information found"
                 )
             else:
@@ -769,9 +793,11 @@ for message in st.session_state.messages:
 # ---------------------------------------------------------------------------
 # CHAT INPUT — greetings/farewells + RAG answer, ported exactly from client.py
 # ---------------------------------------------------------------------------
+no_docs_for_current_selection = not current_index_exists(st.session_state.vector_engine, st.session_state.embed_model)
+
 question = st.chat_input(
-    "Ask a question regarding the loaded documents...",
-    disabled=st.session_state.generating
+    "Upload documents and Rebuild first..." if no_docs_for_current_selection else "Ask a question regarding the loaded documents...",
+    disabled=st.session_state.generating or no_docs_for_current_selection
 )
 
 if not st.session_state.generating and st.session_state.get("pending_question"):

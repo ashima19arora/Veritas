@@ -1,0 +1,23 @@
+services:
+  veritas:
+    build: .
+    image: veritas
+    container_name: veritas
+    user: root
+    ports:
+      - "8501:8501"
+    volumes:
+      # Documents and vector indexes persist on the host, survive container restarts.
+      # Embedding models are baked into the image itself, not mounted.
+      - ./docs:/app/docs
+      - ./vectorstore_index:/app/vectorstore_index
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+    extra_hosts:
+      # Lets the container reach Ollama running on the host machine (Linux needs this explicitly;
+      # Docker Desktop on Mac/Windows usually handles it automatically, this line is harmless either way)
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

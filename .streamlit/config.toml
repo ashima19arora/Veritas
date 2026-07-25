@@ -1,0 +1,5 @@
+[server]
+fileWatcherType = "none"   # disable file watcher — not needed inside Docker container
+
+[browser]
+gatherUsageStats = false   # disable Streamlit telemetry
