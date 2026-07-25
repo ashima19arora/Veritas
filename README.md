@@ -1,6 +1,6 @@
-# VERITAS — Offline Multi-Agent Research & Fact-Verification System
+# VERITAS
 
-Secure offline multi-agent research system powered by Ollama.
+Secure Offline Multi-Agent Research & Fact-Verification System powered by Ollama.
 Every answer is researched, independently verified, checked for contradictions, and cited — before you ever see it.
 
 **Veritas** is Latin for _truth_. That's the whole premise of this project: an AI system that doesn't just answer confidently, but actually checks whether it's earned the right to.
