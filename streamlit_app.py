@@ -22,6 +22,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("ollama").setLevel(logging.WARNING)
 
 import time
+import re
+import concurrent.futures
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -48,6 +50,7 @@ os.makedirs(VECTOR_DB_DIR, exist_ok=True)
 
 GREETINGS = ["hi", "hello", "hey", "how are you", "good morning", "good evening"]
 FAREWELLS = ["bye", "goodbye", "exit", "quit", "see you", "take care", "thanks", "thank you"]
+GUARDRAIL_PHRASE = "I cannot find sufficient verified data within the loaded documents."
 
 st.set_page_config(page_title="Offline Fact-Verification", layout="centered")
 
@@ -107,28 +110,35 @@ def get_ollama_models():
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_embeddings():
-    import torch as _torch
-    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    try:
+        import torch as _torch
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"   # torch/CUDA check failed — fall back safely rather than crashing
     local_path = os.path.join("models", EMBED_MODEL_FOLDER)
-    if os.path.exists(local_path):
+    try:
+        if os.path.exists(local_path):
+            return HuggingFaceEmbeddings(
+                model_name=local_path,
+                model_kwargs={"device": device},
+                encode_kwargs={"batch_size": 8}
+            )
+        namespace = f"BAAI/{EMBED_MODEL_FOLDER}" if "bge" in EMBED_MODEL_FOLDER \
+                    else f"sentence-transformers/{EMBED_MODEL_FOLDER}"
         return HuggingFaceEmbeddings(
-            model_name=local_path,
+            model_name=namespace,
             model_kwargs={"device": device},
             encode_kwargs={"batch_size": 8}
         )
-    namespace = f"BAAI/{EMBED_MODEL_FOLDER}" if "bge" in EMBED_MODEL_FOLDER \
-                else f"sentence-transformers/{EMBED_MODEL_FOLDER}"
-    return HuggingFaceEmbeddings(
-        model_name=namespace,
-        model_kwargs={"device": device},
-        encode_kwargs={"batch_size": 8}
-    )
+    except Exception as e:
+        st.error(f"Could not load embedding model: {e}. Check that models/{EMBED_MODEL_FOLDER} contains valid model files.")
+        raise
 
 def index_exists():
     return os.path.exists(os.path.join(VECTOR_DB_DIR, "index.faiss"))
 
 def load_and_chunk_documents():
-    """Ported exactly from server.py's load_and_chunk_documents() — skips hidden/Mac files, skips unreadable files."""
+    """Ported exactly from server.py's load_and_chunk_documents() — skips hidden/Mac files, skips unreadable files (e.g. password-protected PDFs, corrupted files) and reports which ones."""
     chunks = []
     skipped = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
@@ -142,14 +152,19 @@ def load_and_chunk_documents():
             elif ext in ("docx", "doc"): docs = Docx2txtLoader(fpath).load()
             elif ext == "txt":            docs = TextLoader(fpath, encoding="utf-8").load()
             else: continue
+            if not docs or not any(d.page_content.strip() for d in docs):
+                skipped.append(fname)   # loaded but empty (e.g. scanned/image-only PDF, no extractable text)
+                continue
             chunks.extend(splitter.split_documents(docs))
         except Exception:
-            skipped.append(fname)
-    return chunks
+            skipped.append(fname)   # unreadable — password-protected, corrupted, or unsupported encoding
+    return chunks, skipped
 
 def rebuild_index():
     """Rebuild FAISS index from all docs in DOCS_DIR. Returns True on success, False if no docs (matches server.py's rebuild_all_indexes contract)."""
-    chunks = load_and_chunk_documents()
+    chunks, skipped = load_and_chunk_documents()
+    if skipped:
+        st.warning(f"Could not read {len(skipped)} file(s): {', '.join(skipped)} — may be password-protected, corrupted, or contain no extractable text.")
     if not chunks:
         # no docs left — wipe stale index so nothing stale can be queried (last-doc-delete bug fix from VEDA)
         import shutil
@@ -167,10 +182,17 @@ def load_vectorstore():
     if st.session_state.vectorstore is not None:
         return st.session_state.vectorstore
     if index_exists():
-        embeddings = get_embeddings()
-        vs = FAISS.load_local(VECTOR_DB_DIR, embeddings, allow_dangerous_deserialization=True)
-        st.session_state.vectorstore = vs
-        return vs
+        try:
+            embeddings = get_embeddings()
+            vs = FAISS.load_local(VECTOR_DB_DIR, embeddings, allow_dangerous_deserialization=True)
+            st.session_state.vectorstore = vs
+            return vs
+        except Exception as e:
+            st.error(f"Saved index appears corrupted ({e}). Wiping it — please re-upload documents and rebuild.")
+            import shutil
+            shutil.rmtree(VECTOR_DB_DIR, ignore_errors=True)
+            os.makedirs(VECTOR_DB_DIR, exist_ok=True)
+            return None
     return None
 
 # ---------------------------------------------------------------------------
@@ -187,7 +209,7 @@ def retrieve_chunks(vectorstore, query, k=15, top_n=6):
 
 def run_researcher(vectorstore, question, model_name):
     """Stage 1 — retrieve + draft an answer/claims from context. Same prompt as Layer 1."""
-    chunks = retrieve_chunks(vectorstore, question, k=15, top_n=6)
+    chunks = retrieve_chunks(vectorstore, question, k=15, top_n=8)
     context = "\n\n---\n\n".join([c.page_content for c in chunks])
 
     prompt_template = """You are an elite, highly accurate document analysis system.
@@ -198,6 +220,7 @@ Operational Rules:
 2. If the context contains relevant information, answer it directly and completely. Do not append disclaimers after a complete answer.
 3. If and ONLY IF the context contains NO relevant information at all, respond with: "I cannot find sufficient verified data within the loaded documents." — nothing else.
 4. Keep your analysis concise, structured, and objective.
+5. If the Question asks about a specific sub-category (e.g. "AI projects", "cybersecurity projects") and the Context only states a rule generally (not tied to that sub-category), answer with the GENERAL rule and explicitly note that no sub-category-specific rule was found — do NOT combine the general rule with an unrelated detail (like a budget threshold or approval type) to imply a specific rule exists when it doesn't.
 
 Context:
 {context}
@@ -215,7 +238,7 @@ Answer:"""
 def run_verifier(vectorstore, draft_answer, model_name):
     """Stage 2 — independently re-retrieves evidence for the draft's claims, checks support, scores confidence."""
     # Use the draft itself as the search query — an independent re-check, not reusing Researcher's chunks
-    fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=15, top_n=5)
+    fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=15, top_n=7)
     fresh_context = "\n\n---\n\n".join([c.page_content for c in fresh_chunks])
 
     prompt_template = """You are an expert fact-verifier and proofreader. You did NOT write the claim below — your job is to independently check it.
@@ -223,7 +246,7 @@ def run_verifier(vectorstore, draft_answer, model_name):
 Operational Rules:
 1. Compare the Claim against the Evidence below ONLY. Do not use outside knowledge.
 2. For each distinct factual statement in the Claim, judge: SUPPORTED, PARTIALLY SUPPORTED, or NOT SUPPORTED by the Evidence.
-3. Give an overall confidence score from 0.0 to 1.0 for the Claim as a whole (1.0 = fully supported, 0.0 = no support found).
+3. The overall confidence score MUST reflect the WEAKEST verdict among all statements — it is not an average and not based only on the statements that passed. If even one statement is NOT SUPPORTED, the overall score must be 0.4 or lower. If any statement is only PARTIALLY SUPPORTED (and none are NOT SUPPORTED), the overall score must be between 0.4 and 0.7. Only give 0.8-1.0 if EVERY statement is fully SUPPORTED. The score MUST be a decimal between 0.0 and 1.0 ONLY (e.g. 0.75) — never a whole number, never a percentage, never a number above 1.0.
 4. If the Evidence contains nothing relevant to judge the Claim, say so explicitly and give confidence 0.0.
 5. Be concise — short verdict per statement, then the overall score. No extra commentary.
 
@@ -247,14 +270,27 @@ def run_contradiction_check(researcher_chunks, model_name):
 
     numbered = "\n\n".join([f"[Chunk {i+1}]\n{c.page_content}" for i, c in enumerate(researcher_chunks)])
 
-    prompt_template = """You are a contradiction-detection system. You will be given several document excerpts, numbered.
+    prompt_template = """You are a strict contradiction-detection system. You will be given several document excerpts, numbered.
 
-Operational Rules:
-1. Extract the concrete factual claims (dates, numbers, named facts, stated rules) from each chunk.
-2. Compare claims ACROSS chunks. Flag any pair of chunks that state directly conflicting facts.
-3. If no conflicts exist, respond with exactly: "No contradictions detected across the retrieved chunks."
-4. If conflicts exist, list them as: "Chunk X vs Chunk Y: [conflicting facts] — [why they conflict]"
-5. Do not flag things as contradictions unless they are genuinely incompatible facts, not just different topics.
+A REAL contradiction means: two chunks state DIFFERENT NUMBERS OR VALUES about the EXACT SAME subject and scope that CANNOT both be true at the same time.
+
+Do NOT flag as a contradiction:
+- The same fact worded differently in two chunks (e.g. "start() creates a new thread" and "calling start() creates a new thread, then runs it" — these AGREE, just one has more detail)
+- Two chunks stating the SAME NUMBER, even if scope/wording differs (e.g. "team size is 4" and "team size is 4 for projects under ₹1 crore" — SAME number, 4 = 4, this is NOT a conflict)
+- A general rule plus a specific exception with a DIFFERENT number for the exception case ONLY (e.g. "minimum team size is 4" and "minimum team size is 5 for projects over ₹2 crore" — the second is a special case, NOT a conflict)
+- Two chunks about different topics that happen to share a keyword
+- A chunk elaborating on or adding detail to another chunk's claim
+
+Before flagging anything, double-check: are the two numbers/values ACTUALLY different? If they are the same number, it is NOT a contradiction, no matter how the scope is worded.
+
+ONLY flag as a contradiction: two chunks giving genuinely DIFFERENT VALUES for the exact same specific thing under the exact same scope (e.g. one chunk says the deadline is 45 days, another chunk says the deadline for that SAME scenario is 60 days — different numbers, same scope — that's a real conflict).
+
+Steps:
+1. Extract concrete factual claims (dates, numbers, named facts, stated rules) from each chunk, noting the exact scope each claim applies to.
+2. Compare claims only within the SAME scope across chunks. Verify the numbers are actually different before flagging.
+3. Decide ONCE: either contradictions exist, or they don't.
+4. If NONE exist, your ENTIRE response must be exactly: "No contradictions detected across the retrieved chunks." — nothing else, no lists, no explanation.
+5. If real contradictions exist, your ENTIRE response must be ONLY the list, in this format: "Chunk X vs Chunk Y: [conflicting values, same scope] — [why they cannot both be true]" — do NOT add the "No contradictions detected" line anywhere if you are listing real conflicts.
 
 Chunks:
 {chunks}
@@ -263,7 +299,15 @@ Contradiction Analysis:"""
     prompt = PromptTemplate(template=prompt_template, input_variables=["chunks"])
     llm = OllamaLLM(model=model_name, temperature=0.1)
     chain = prompt | llm | StrOutputParser()
-    return chain.invoke({"chunks": numbered})
+    result = chain.invoke({"chunks": numbered})
+
+    # Safety net: if the model listed real contradictions (contains "Chunk") but also
+    # appended the "no contradictions" line, strip that trailing contradictory sentence.
+    no_conflict_line = "No contradictions detected across the retrieved chunks."
+    if "Chunk" in result and no_conflict_line in result:
+        result = result.replace(no_conflict_line, "").strip()
+
+    return result
 
 def run_synthesizer(question, draft_answer, verification, contradiction_report, model_name):
     """Stage 4 — compiles everything into one final, clean, cited report for the user."""
@@ -273,8 +317,10 @@ Operational Rules:
 1. Base your final answer on the Draft Answer, adjusted per the Verification findings.
 2. If Verification flagged something as NOT SUPPORTED, remove or clearly caveat it in the final answer — do not present unsupported claims as fact.
 3. If the Contradiction Analysis found conflicts, add a short "Note" at the end flagging this to the user.
-4. Include the overall confidence level near the end (High / Medium / Low), based on the Verification's score.
-5. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
+4. Check the Draft Answer for FABRICATED CONNECTIONS: if it links two separately-true facts together in a way not explicitly stated in the Evidence (e.g. combining a general rule with an unrelated threshold or condition), flag this explicitly in your Note — even if each individual fact was separately marked SUPPORTED.
+5. If the Original Question asks about something more specific than what the documents cover (e.g. asks about a sub-category that the documents only address generally), say so plainly instead of implying a specific rule exists.
+6. ALWAYS end with a line in this EXACT format: "Confidence Level: [High/Medium/Low] (X.X)" — where X.X is the numeric score from Verification. Never omit the number. If Verification was skipped, omit this line entirely.
+7. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
 
 Original Question:
 {question}
@@ -296,6 +342,29 @@ Final Answer:"""
         "question": question, "draft": draft_answer,
         "verification": verification, "contradiction": contradiction_report,
     })
+
+def extract_and_strip_confidence(answer_text):
+    """Pulls the 'Confidence Level: X (Y.Y)' line out of the answer body so it can be
+    shown in the caption instead, and returns the cleaned answer text plus the extracted string.
+    Also normalizes/clamps the score if the model outputs it on the wrong scale (e.g. 8.2 instead of 0.82)."""
+    match = re.search(r"Confidence Level:\s*(High|Medium|Low)\s*\(?([\d.]+)?\)?", answer_text, re.IGNORECASE)
+    if not match:
+        return answer_text.strip(), None
+    level = match.group(1).capitalize()
+    score = match.group(2)
+    if score:
+        try:
+            score_val = float(score)
+            if score_val > 1.0:
+                # model likely wrote a 0-10 or 0-100 scale value by mistake — normalize down
+                score_val = score_val / 10 if score_val <= 10 else score_val / 100
+            score_val = max(0.0, min(1.0, score_val))   # hard clamp, never outside 0.0-1.0
+            score = f"{score_val:.2f}"
+        except ValueError:
+            score = None
+    confidence_str = f"{level} ({score})" if score else level
+    cleaned = answer_text[:match.start()].rstrip(" \n-—:")
+    return cleaned, confidence_str
 
 # ---------------------------------------------------------------------------
 # DOC LIST FRAGMENT — ported exactly from client.py's doc_list_section()
@@ -366,13 +435,16 @@ with st.sidebar:
 
     if st.session_state.force_rebuild:
         with st.spinner("Rebuilding index..."):
-            ok = rebuild_index()
-            if ok:
-                st.session_state.just_rebuilt = True
-                st.session_state.last_rebuilt_time = time.time()
-                st.session_state.pending_deletes = set()
-            else:
-                st.warning("No documents found to index.")
+            try:
+                ok = rebuild_index()
+                if ok:
+                    st.session_state.just_rebuilt = True
+                    st.session_state.last_rebuilt_time = time.time()
+                    st.session_state.pending_deletes = set()
+                else:
+                    st.warning("No documents found to index.")
+            except Exception as e:
+                st.error(f"Index rebuild failed: {e}. Check your documents and try again.")
         st.session_state.force_rebuild = False
         st.rerun()
 
@@ -476,16 +548,35 @@ elif st.session_state.generating and st.session_state.processing_task == "delete
     st.rerun()
 
 # ---------------------------------------------------------------------------
-# CHAT HISTORY
+# CHAT HISTORY — replays persisted stage boxes for past multi-agent answers
 # ---------------------------------------------------------------------------
 for message in st.session_state.messages:
     with st.chat_message(message["role"], avatar="🧑\u200d💻" if message["role"] == "user" else "🖥️"):
+        if message.get("stages"):
+            stages = message["stages"]
+            with st.expander("Stage 1 — Researcher", expanded=False):
+                st.write(stages["draft_answer"])
+            if stages.get("skipped_verification"):
+                st.caption("Stages 2+3 skipped — Researcher found no relevant information to verify.")
+            else:
+                with st.expander("Stage 2+3 — Verifier & Contradiction check", expanded=False):
+                    st.write("**Verification:**")
+                    st.write(stages["verification"])
+                    st.write("**Contradiction check:**")
+                    st.write(stages["contradiction_report"])
         st.write(message["content"])
         if "latency" in message:
-            st.caption(
-                f"{message['latency']:.2f}s | LLM: {message['engine']} | "
-                f"Embed: {message.get('embed', EMBED_MODEL_FOLDER)}"
-            )
+            if message.get("guardrail_triggered"):
+                st.caption(
+                    f"{message['latency']:.2f}s | LLM: {message['engine']} | "
+                    f"Correctly declined — no relevant information found"
+                )
+            else:
+                conf_part = f" | Confidence: {message['confidence_str']}" if message.get("confidence_str") else ""
+                st.caption(
+                    f"{message['latency']:.2f}s | LLM: {message['engine']} | "
+                    f"Embed: {message.get('embed', EMBED_MODEL_FOLDER)}{conf_part}"
+                )
 
 # ---------------------------------------------------------------------------
 # CHAT INPUT — greetings/farewells + RAG answer, ported exactly from client.py
@@ -538,28 +629,58 @@ if question:
                             st.write(draft_answer)
                             status1.update(label="Stage 1 — Researcher: draft complete", state="complete")
 
-                        with st.status("Verifying claims independently...", expanded=False) as status2:
-                            verification, verifier_chunks = run_verifier(vectorstore, draft_answer, selected_model)
-                            st.write(verification)
-                            status2.update(label="Stage 2 — Verifier: check complete", state="complete")
+                        guardrail_triggered = GUARDRAIL_PHRASE in draft_answer
 
-                        with st.status("Checking for contradictions...", expanded=False) as status3:
-                            contradiction_report = run_contradiction_check(researcher_chunks, selected_model)
-                            st.write(contradiction_report)
-                            status3.update(label="Stage 3 — Contradiction check: complete", state="complete")
+                        if guardrail_triggered:
+                            # No relevant context found — skip Verifier/Contradiction, nothing to check.
+                            final_answer = draft_answer
+                            verification = None
+                            contradiction_report = None
+                            st.caption("Stages 2+3 skipped — no relevant information found to verify.")
+                        else:
+                            # Stage 2 (Verifier) and Stage 3 (Contradiction check) both only need
+                            # Researcher's output, not each other — run them concurrently.
+                            with st.status("Verifying claims + checking contradictions...", expanded=False) as status23:
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                                    future_verify = executor.submit(run_verifier, vectorstore, draft_answer, selected_model)
+                                    future_contradict = executor.submit(run_contradiction_check, researcher_chunks, selected_model)
+                                    verification, verifier_chunks = future_verify.result()
+                                    contradiction_report = future_contradict.result()
+                                st.write("**Verification:**")
+                                st.write(verification)
+                                st.write("**Contradiction check:**")
+                                st.write(contradiction_report)
+                                status23.update(label="Stage 2+3 — Verifier & Contradiction check: complete", state="complete")
 
-                        with st.status("Synthesizing final report...", expanded=True) as status4:
-                            final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model)
-                            status4.update(label="Stage 4 — Synthesizer: report ready", state="complete")
+                            with st.status("Synthesizing final report...", expanded=True) as status4:
+                                final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model)
+                                status4.update(label="Stage 4 — Synthesizer: report ready", state="complete")
+
+                        if guardrail_triggered:
+                            confidence_str = None
+                        else:
+                            final_answer, confidence_str = extract_and_strip_confidence(final_answer)
 
                         response_area.markdown(final_answer)
 
                         latency = time.time() - start
-                        st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {EMBED_MODEL_FOLDER}")
+                        if guardrail_triggered:
+                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Correctly declined — no relevant information found")
+                        else:
+                            conf_part = f" | Confidence: {confidence_str}" if confidence_str else ""
+                            st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {EMBED_MODEL_FOLDER}{conf_part}")
 
                         st.session_state.messages.append({
                             "role": "assistant", "content": final_answer,
                             "latency": latency, "engine": selected_model, "embed": EMBED_MODEL_FOLDER,
+                            "guardrail_triggered": guardrail_triggered,
+                            "confidence_str": confidence_str,
+                            "stages": {
+                                "draft_answer": draft_answer,
+                                "verification": verification,
+                                "contradiction_report": contradiction_report,
+                                "skipped_verification": guardrail_triggered,
+                            },
                         })
 
                     except Exception as e:
