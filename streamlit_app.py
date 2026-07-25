@@ -49,7 +49,7 @@ os.makedirs(VECTOR_DB_DIR, exist_ok=True)
 GREETINGS = ["hi", "hello", "hey", "how are you", "good morning", "good evening"]
 FAREWELLS = ["bye", "goodbye", "exit", "quit", "see you", "take care", "thanks", "thank you"]
 
-st.set_page_config(page_title="VERITAS", layout="centered")
+st.set_page_config(page_title="Offline Fact-Verification", layout="centered")
 
 st.markdown("""
 <style>
@@ -61,7 +61,7 @@ st.markdown("""
     [data-testid="stHorizontalBlock"]:has([class*="st-key-delete_"]) { gap: 0.4rem; margin-bottom: -0.6rem; }
     [class*="st-key-delete_"] button { font-weight: 700; font-size: 1.05rem; padding: 0rem 0.3rem; min-height: 1.5rem; color: #888888; }
     [class*="st-key-delete_"] button:hover { color: #e03131; }
-    .system-caption { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 0.8rem; color: #888; }
+    .system-caption { font-size: 0.82rem; color: #6b6b6b; margin-top: -0.3rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -174,6 +174,130 @@ def load_vectorstore():
     return None
 
 # ---------------------------------------------------------------------------
+# LAYER 2 — MULTI-AGENT PIPELINE
+# Same Ollama model, 4 different prompts/jobs, called in sequence.
+# Each stage has its own guardrail, same ideology as Layer 1's proven prompt.
+# ---------------------------------------------------------------------------
+
+def retrieve_chunks(vectorstore, query, k=15, top_n=6):
+    """Shared retrieval tool: bi-encoder search (k) -> cross-encoder-style trim to top_n.
+    (FlashRank rerank slotted in here later — for now trims by vector similarity order.)"""
+    candidates = vectorstore.similarity_search(query, k=k)
+    return candidates[:top_n]
+
+def run_researcher(vectorstore, question, model_name):
+    """Stage 1 — retrieve + draft an answer/claims from context. Same prompt as Layer 1."""
+    chunks = retrieve_chunks(vectorstore, question, k=15, top_n=6)
+    context = "\n\n---\n\n".join([c.page_content for c in chunks])
+
+    prompt_template = """You are an elite, highly accurate document analysis system.
+Review the provided context carefully to address the query.
+
+Operational Rules:
+1. Rely ONLY on facts directly mentioned in the Context below. Do not extrapolate or hallucinate.
+2. If the context contains relevant information, answer it directly and completely. Do not append disclaimers after a complete answer.
+3. If and ONLY IF the context contains NO relevant information at all, respond with: "I cannot find sufficient verified data within the loaded documents." — nothing else.
+4. Keep your analysis concise, structured, and objective.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    llm = OllamaLLM(model=model_name, temperature=0.2)
+    chain = prompt | llm | StrOutputParser()
+    draft = chain.invoke({"context": context, "question": question})
+    return draft, chunks
+
+def run_verifier(vectorstore, draft_answer, model_name):
+    """Stage 2 — independently re-retrieves evidence for the draft's claims, checks support, scores confidence."""
+    # Use the draft itself as the search query — an independent re-check, not reusing Researcher's chunks
+    fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=15, top_n=5)
+    fresh_context = "\n\n---\n\n".join([c.page_content for c in fresh_chunks])
+
+    prompt_template = """You are an expert fact-verifier and proofreader. You did NOT write the claim below — your job is to independently check it.
+
+Operational Rules:
+1. Compare the Claim against the Evidence below ONLY. Do not use outside knowledge.
+2. For each distinct factual statement in the Claim, judge: SUPPORTED, PARTIALLY SUPPORTED, or NOT SUPPORTED by the Evidence.
+3. Give an overall confidence score from 0.0 to 1.0 for the Claim as a whole (1.0 = fully supported, 0.0 = no support found).
+4. If the Evidence contains nothing relevant to judge the Claim, say so explicitly and give confidence 0.0.
+5. Be concise — short verdict per statement, then the overall score. No extra commentary.
+
+Evidence:
+{evidence}
+
+Claim to verify:
+{claim}
+
+Verification:"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["evidence", "claim"])
+    llm = OllamaLLM(model=model_name, temperature=0.1)
+    chain = prompt | llm | StrOutputParser()
+    verification = chain.invoke({"evidence": fresh_context, "claim": draft_answer})
+    return verification, fresh_chunks
+
+def run_contradiction_check(researcher_chunks, model_name):
+    """Stage 3 — checks the Researcher's own retrieved chunks against each other for internal conflicts."""
+    if len(researcher_chunks) < 2:
+        return "Not enough distinct chunks retrieved to check for contradictions."
+
+    numbered = "\n\n".join([f"[Chunk {i+1}]\n{c.page_content}" for i, c in enumerate(researcher_chunks)])
+
+    prompt_template = """You are a contradiction-detection system. You will be given several document excerpts, numbered.
+
+Operational Rules:
+1. Extract the concrete factual claims (dates, numbers, named facts, stated rules) from each chunk.
+2. Compare claims ACROSS chunks. Flag any pair of chunks that state directly conflicting facts.
+3. If no conflicts exist, respond with exactly: "No contradictions detected across the retrieved chunks."
+4. If conflicts exist, list them as: "Chunk X vs Chunk Y: [conflicting facts] — [why they conflict]"
+5. Do not flag things as contradictions unless they are genuinely incompatible facts, not just different topics.
+
+Chunks:
+{chunks}
+
+Contradiction Analysis:"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["chunks"])
+    llm = OllamaLLM(model=model_name, temperature=0.1)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"chunks": numbered})
+
+def run_synthesizer(question, draft_answer, verification, contradiction_report, model_name):
+    """Stage 4 — compiles everything into one final, clean, cited report for the user."""
+    prompt_template = """You are a synthesis agent. Compile the material below into ONE final, clean answer for the user.
+
+Operational Rules:
+1. Base your final answer on the Draft Answer, adjusted per the Verification findings.
+2. If Verification flagged something as NOT SUPPORTED, remove or clearly caveat it in the final answer — do not present unsupported claims as fact.
+3. If the Contradiction Analysis found conflicts, add a short "Note" at the end flagging this to the user.
+4. Include the overall confidence level near the end (High / Medium / Low), based on the Verification's score.
+5. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
+
+Original Question:
+{question}
+
+Draft Answer:
+{draft}
+
+Verification Findings:
+{verification}
+
+Contradiction Analysis:
+{contradiction}
+
+Final Answer:"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["question", "draft", "verification", "contradiction"])
+    llm = OllamaLLM(model=model_name, temperature=0.2)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({
+        "question": question, "draft": draft_answer,
+        "verification": verification, "contradiction": contradiction_report,
+    })
+
+# ---------------------------------------------------------------------------
 # DOC LIST FRAGMENT — ported exactly from client.py's doc_list_section()
 # ---------------------------------------------------------------------------
 @st.fragment
@@ -280,8 +404,7 @@ col1, col2 = st.columns([4, 1.5])
 with col1:
     st.title("VERITAS")
     st.markdown(
-        f'<div class="system-caption">Offline Research & Fact-Verification System — {selected_model} | '
-        f'Embed: {EMBED_MODEL_FOLDER} | Engine: FAISS</div>',
+        '<div class="system-caption">Secure offline multi-agent research system powered by Ollama</div>',
         unsafe_allow_html=True
     )
 with col2:
@@ -399,67 +522,49 @@ if question:
             else:
                 vectorstore = load_vectorstore()
                 response_area = st.empty()
-                status_area   = st.empty()
 
                 if vectorstore is None:
                     response_area.warning("No index built yet. Upload documents and click Rebuild Vector Index in the sidebar.")
                 else:
                     if st.session_state.get("just_rebuilt"):
-                        response_area.markdown("_Thinking... (first question after rebuild — slightly slower)_")
                         st.session_state.just_rebuilt = False
-                    else:
-                        response_area.markdown("_Thinking... (Scanning Vector Nodes)_")
 
                     st.session_state.generating = True
                     try:
                         start = time.time()
 
-                        raw_docs = vectorstore.similarity_search(question, k=6)
-                        context = "\n\n---\n\n".join([d.page_content for d in raw_docs])
+                        with st.status("Researching...", expanded=False) as status1:
+                            draft_answer, researcher_chunks = run_researcher(vectorstore, question, selected_model)
+                            st.write(draft_answer)
+                            status1.update(label="Stage 1 — Researcher: draft complete", state="complete")
 
-                        # PROMPT — kept exact, word-for-word from VEDA's proven standard-mode prompt
-                        prompt_template = """You are an elite, highly accurate document analysis system.
-Review the provided context carefully to address the query.
+                        with st.status("Verifying claims independently...", expanded=False) as status2:
+                            verification, verifier_chunks = run_verifier(vectorstore, draft_answer, selected_model)
+                            st.write(verification)
+                            status2.update(label="Stage 2 — Verifier: check complete", state="complete")
 
-Operational Rules:
-1. Rely ONLY on facts directly mentioned in the Context below. Do not extrapolate or hallucinate.
-2. If the context contains relevant information, answer it directly and completely. Do not append disclaimers after a complete answer.
-3. If and ONLY IF the context contains NO relevant information at all, respond with: "I cannot find sufficient verified data within the loaded documents." — nothing else.
-4. Keep your analysis concise, structured, and objective.
+                        with st.status("Checking for contradictions...", expanded=False) as status3:
+                            contradiction_report = run_contradiction_check(researcher_chunks, selected_model)
+                            st.write(contradiction_report)
+                            status3.update(label="Stage 3 — Contradiction check: complete", state="complete")
 
-Context:
-{context}
+                        with st.status("Synthesizing final report...", expanded=True) as status4:
+                            final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model)
+                            status4.update(label="Stage 4 — Synthesizer: report ready", state="complete")
 
-Question:
-{question}
-
-Answer:"""
-                        prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-                        llm = OllamaLLM(model=selected_model, temperature=0.2)
-                        chain = prompt | llm | StrOutputParser()
-
-                        accumulated = ""
-                        for chunk in chain.stream({"context": context, "question": question}):
-                            accumulated += chunk
-                            response_area.markdown(accumulated)
-                            status_area.caption(f"Reasoning via {selected_model}... {time.time() - start:.0f}s")
-
-                        if not accumulated:
-                            accumulated = "_(No response received from Ollama. Check that the model is running.)_"
-                            response_area.markdown(accumulated)
+                        response_area.markdown(final_answer)
 
                         latency = time.time() - start
-                        status_area.caption(f"{latency:.2f}s | LLM: {selected_model} | Embed: {EMBED_MODEL_FOLDER}")
+                        st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {EMBED_MODEL_FOLDER}")
 
                         st.session_state.messages.append({
-                            "role": "assistant", "content": accumulated,
+                            "role": "assistant", "content": final_answer,
                             "latency": latency, "engine": selected_model, "embed": EMBED_MODEL_FOLDER,
                         })
 
                     except Exception as e:
                         error_message = f"Something went wrong while generating an answer: {e}"
                         response_area.markdown(error_message)
-                        status_area.empty()
                         st.session_state.messages.append({"role": "assistant", "content": error_message})
 
                     finally:
