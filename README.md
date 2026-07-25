@@ -84,8 +84,8 @@ No single stage's output is final until something else has checked it.
 
 > **Note on large files:** the pre-built Docker image and the embedding model weights both exceed GitHub's 100MB file size limit, so they're hosted separately rather than committed to this repository:
 >
-> - **Pre-built Docker image (`veritas.tar`):** [Download](https://drive.google.com/file/d/1Q5uTmj70zxJCS4D1mAJwccXKXFNBd4Nf/view?usp=sharing)
-> - **Embedding models (`models.zip`):** [Download](https://drive.google.com/file/d/1IlfI9FE9tPYQUswdGgnRhIlmXY4VcmaT/view?usp=sharing)
+> - **Pre-built Docker image (`veritas.tar`, ~893MB):** [Download](https://drive.google.com/file/d/1Q5uTmj70zxJCS4D1mAJwccXKXFNBd4Nf/view?usp=sharing)
+> - **Embedding models (`models.zip`, ~156MB):** [Download](https://drive.google.com/file/d/1IlfI9FE9tPYQUswdGgnRhIlmXY4VcmaT/view?usp=sharing)
 
 ### Option A — Docker (recommended)
 
