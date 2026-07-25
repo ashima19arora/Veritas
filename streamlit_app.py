@@ -23,6 +23,7 @@ logging.getLogger("ollama").setLevel(logging.WARNING)
 
 import time
 import re
+import numpy as np
 import concurrent.futures
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -33,6 +34,7 @@ from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import ollama as ollama_client
+from flashrank import Ranker, RerankRequest
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -201,11 +203,70 @@ def load_vectorstore():
 # Each stage has its own guardrail, same ideology as Layer 1's proven prompt.
 # ---------------------------------------------------------------------------
 
+@st.cache_resource
+def get_flashrank_engine():
+    """Tiny local cross-encoder — re-scores candidates by true semantic relevance, not just vector distance."""
+    return Ranker()
+
 def retrieve_chunks(vectorstore, query, k=15, top_n=6):
-    """Shared retrieval tool: bi-encoder search (k) -> cross-encoder-style trim to top_n.
-    (FlashRank rerank slotted in here later — for now trims by vector similarity order.)"""
+    """Two-stage retrieval, matches VEDA exactly: bi-encoder search (k=15 candidates)
+    -> FlashRank cross-encoder rerank -> top_n most relevant chunks, in true-relevance order."""
     candidates = vectorstore.similarity_search(query, k=k)
-    return candidates[:top_n]
+    if not candidates:
+        return []
+    try:
+        flash_ranker = get_flashrank_engine()
+        payload = [{"id": i, "text": c.page_content} for i, c in enumerate(candidates)]
+        ranked = flash_ranker.rerank(RerankRequest(query=query, passages=payload))
+        result_docs = []
+        for r in ranked[:top_n]:
+            idx = r.get("id")
+            if idx is not None and idx < len(candidates):
+                result_docs.append(candidates[idx])
+        return result_docs if result_docs else candidates[:top_n]
+    except Exception:
+        # FlashRank failed for any reason (e.g. model download issue) — fall back to plain similarity order
+        return candidates[:top_n]
+
+def extract_sources(chunks):
+    """Builds a clean 'doc (pg N)' list from chunk metadata, deduplicated, in order of first appearance."""
+    sources = []
+    seen = set()
+    for c in chunks:
+        doc = c.metadata.get("source", "")
+        page = c.metadata.get("page", None)
+        doc_name = os.path.basename(doc) if doc else "unknown"
+        key = (doc_name, page)
+        if key not in seen:
+            seen.add(key)
+            sources.append(f"{doc_name} (pg {page + 1})" if page is not None else doc_name)
+    return sources
+
+def compute_grounding_score(claim_text, source_chunks):
+    """OBJECTIVE confidence signal — independent of the LLM's own self-grading.
+    Embeds the claim text and each source chunk (reusing the already-loaded embedding
+    model), measures cosine similarity, returns the best match. Low similarity here
+    means the claim drifted from what the source actually says, even if the LLM
+    confidently graded itself SUPPORTED — this is real math, not the model's opinion."""
+    if not source_chunks:
+        return 0.0
+    try:
+        embeddings = get_embeddings()
+        claim_vec = np.array(embeddings.embed_query(claim_text))
+        claim_norm = np.linalg.norm(claim_vec)
+        if claim_norm == 0:
+            return 0.0
+        best_similarity = 0.0
+        for chunk in source_chunks:
+            chunk_vec = np.array(embeddings.embed_query(chunk.page_content))
+            chunk_norm = np.linalg.norm(chunk_vec)
+            if chunk_norm == 0:
+                continue
+            similarity = float(np.dot(claim_vec, chunk_vec) / (claim_norm * chunk_norm))
+            best_similarity = max(best_similarity, similarity)
+        return round(best_similarity, 3)
+    except Exception:
+        return None   # grounding check failed for any reason — don't block the pipeline, just skip this signal
 
 def run_researcher(vectorstore, question, model_name):
     """Stage 1 — retrieve + draft an answer/claims from context. Same prompt as Layer 1."""
@@ -261,7 +322,13 @@ Verification:"""
     llm = OllamaLLM(model=model_name, temperature=0.1)
     chain = prompt | llm | StrOutputParser()
     verification = chain.invoke({"evidence": fresh_context, "claim": draft_answer})
-    return verification, fresh_chunks
+
+    # OBJECTIVE signal — independent of the LLM's self-grading above.
+    grounding_score = compute_grounding_score(draft_answer, fresh_chunks)
+    if grounding_score is not None:
+        verification += f"\n\n[Automated grounding check — embedding similarity between claim and evidence: {grounding_score:.2f}]"
+
+    return verification, fresh_chunks, grounding_score
 
 def run_contradiction_check(researcher_chunks, model_name):
     """Stage 3 — checks the Researcher's own retrieved chunks against each other for internal conflicts."""
@@ -280,6 +347,7 @@ Do NOT flag as a contradiction:
 - A general rule plus a specific exception with a DIFFERENT number for the exception case ONLY (e.g. "minimum team size is 4" and "minimum team size is 5 for projects over ₹2 crore" — the second is a special case, NOT a conflict)
 - Two chunks about different topics that happen to share a keyword
 - A chunk elaborating on or adding detail to another chunk's claim
+- Two DIFFERENT specific entities each correctly having a different value by design (e.g. "Bootstrap class loader = most trusted" and "Extension class loader = medium trust" are TWO DIFFERENT class loaders, each with its own correct trust level — this is a hierarchy working as intended, NOT a conflict. Only flag this kind of comparison if the SAME single entity is given two different values in different chunks.)
 
 Before flagging anything, double-check: are the two numbers/values ACTUALLY different? If they are the same number, it is NOT a contradiction, no matter how the scope is worded.
 
@@ -309,8 +377,13 @@ Contradiction Analysis:"""
 
     return result
 
-def run_synthesizer(question, draft_answer, verification, contradiction_report, model_name):
+def run_synthesizer(question, draft_answer, verification, contradiction_report, model_name, grounding_score=None):
     """Stage 4 — compiles everything into one final, clean, cited report for the user."""
+    grounding_note = (
+        f"\n\nAutomated grounding score (independent embedding-similarity check, 0.0-1.0, "
+        f"higher = better math-verified match between claim and evidence): {grounding_score:.2f}"
+        if grounding_score is not None else ""
+    )
     prompt_template = """You are a synthesis agent. Compile the material below into ONE final, clean answer for the user.
 
 Operational Rules:
@@ -319,8 +392,9 @@ Operational Rules:
 3. If the Contradiction Analysis found conflicts, add a short "Note" at the end flagging this to the user.
 4. Check the Draft Answer for FABRICATED CONNECTIONS: if it links two separately-true facts together in a way not explicitly stated in the Evidence (e.g. combining a general rule with an unrelated threshold or condition), flag this explicitly in your Note — even if each individual fact was separately marked SUPPORTED.
 5. If the Original Question asks about something more specific than what the documents cover (e.g. asks about a sub-category that the documents only address generally), say so plainly instead of implying a specific rule exists.
-6. ALWAYS end with a line in this EXACT format: "Confidence Level: [High/Medium/Low] (X.X)" — where X.X is the numeric score from Verification. Never omit the number. If Verification was skipped, omit this line entirely.
-7. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
+6. An automated grounding score (independent embedding-similarity math, not the LLM's opinion) is provided below if available. If this score is LOW (below 0.4) but the Verification's self-reported confidence was High, trust the grounding score more — lower your final confidence level and add a note that the automated check found weaker support than the self-assessment suggested.
+7. ALWAYS end with a line in this EXACT format: "Confidence Level: [High/Medium/Low] (X.X)" — where X.X is the numeric score from Verification, adjusted per rule 6 if applicable. Never omit the number. If Verification was skipped, omit this line entirely.
+8. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
 
 Original Question:
 {question}
@@ -329,28 +403,30 @@ Draft Answer:
 {draft}
 
 Verification Findings:
-{verification}
+{verification}{grounding_note}
 
 Contradiction Analysis:
 {contradiction}
 
 Final Answer:"""
-    prompt = PromptTemplate(template=prompt_template, input_variables=["question", "draft", "verification", "contradiction"])
+    prompt = PromptTemplate(template=prompt_template, input_variables=["question", "draft", "verification", "contradiction", "grounding_note"])
     llm = OllamaLLM(model=model_name, temperature=0.2)
     chain = prompt | llm | StrOutputParser()
     return chain.invoke({
         "question": question, "draft": draft_answer,
         "verification": verification, "contradiction": contradiction_report,
+        "grounding_note": grounding_note,
     })
 
 def extract_and_strip_confidence(answer_text):
     """Pulls the 'Confidence Level: X (Y.Y)' line out of the answer body so it can be
     shown in the caption instead, and returns the cleaned answer text plus the extracted string.
-    Also normalizes/clamps the score if the model outputs it on the wrong scale (e.g. 8.2 instead of 0.82)."""
-    match = re.search(r"Confidence Level:\s*(High|Medium|Low)\s*\(?([\d.]+)?\)?", answer_text, re.IGNORECASE)
-    if not match:
+    Also normalizes/clamps the score if the model outputs it on the wrong scale (e.g. 8.2 instead of 0.82).
+    Tolerant of the model omitting the High/Medium/Low word and just giving a number."""
+    match = re.search(r"Confidence Level:\s*(High|Medium|Low)?\s*\(?([\d.]+)?\)?", answer_text, re.IGNORECASE)
+    if not match or (not match.group(1) and not match.group(2)):
         return answer_text.strip(), None
-    level = match.group(1).capitalize()
+    level = match.group(1)
     score = match.group(2)
     if score:
         try:
@@ -360,8 +436,12 @@ def extract_and_strip_confidence(answer_text):
                 score_val = score_val / 10 if score_val <= 10 else score_val / 100
             score_val = max(0.0, min(1.0, score_val))   # hard clamp, never outside 0.0-1.0
             score = f"{score_val:.2f}"
+            if not level:
+                # derive level word from the number if the model didn't give one
+                level = "High" if score_val >= 0.8 else "Medium" if score_val >= 0.4 else "Low"
         except ValueError:
             score = None
+    level = level.capitalize() if level else "Unknown"
     confidence_str = f"{level} ({score})" if score else level
     cleaned = answer_text[:match.start()].rstrip(" \n-—:")
     return cleaned, confidence_str
@@ -643,8 +723,8 @@ if question:
                             with st.status("Verifying claims + checking contradictions...", expanded=False) as status23:
                                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                                     future_verify = executor.submit(run_verifier, vectorstore, draft_answer, selected_model)
-                                    future_contradict = executor.submit(run_contradiction_check, researcher_chunks, selected_model)
-                                    verification, verifier_chunks = future_verify.result()
+                                    future_contradict = executor.submit(run_contradiction_check, researcher_chunks[:5], selected_model)
+                                    verification, verifier_chunks, grounding_score = future_verify.result()
                                     contradiction_report = future_contradict.result()
                                 st.write("**Verification:**")
                                 st.write(verification)
@@ -653,13 +733,21 @@ if question:
                                 status23.update(label="Stage 2+3 — Verifier & Contradiction check: complete", state="complete")
 
                             with st.status("Synthesizing final report...", expanded=True) as status4:
-                                final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model)
+                                final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model, grounding_score)
                                 status4.update(label="Stage 4 — Synthesizer: report ready", state="complete")
 
                         if guardrail_triggered:
                             confidence_str = None
+                            sources_list = []
                         else:
                             final_answer, confidence_str = extract_and_strip_confidence(final_answer)
+                            # Safety override — if the objective math check found weak grounding but the LLM
+                            # still self-reported High, force it down. Don't just trust the prompt to comply.
+                            if grounding_score is not None and grounding_score < 0.35 and confidence_str and "High" in confidence_str:
+                                confidence_str = f"Low ({grounding_score:.2f} grounding — overridden from self-reported High)"
+                            sources_list = extract_sources(researcher_chunks[:3])
+                            if sources_list:
+                                final_answer += "\n\n**Sources:** " + ", ".join(sources_list)
 
                         response_area.markdown(final_answer)
 
