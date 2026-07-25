@@ -47,15 +47,11 @@ from flashrank import Ranker, RerankRequest
 DOCS_DIR       = "docs"
 VECTOR_DB_ROOT = "vectorstore_index"
 ALL_MODELS     = ["bge-small-en-v1.5", "bge-large-en-v1.5", "all-MiniLM-L6-v2"]
-ALL_ENGINES    = ["FAISS", "Chroma", "Qdrant"]
+ALL_ENGINES    = ["FAISS", "Chroma"]   # Qdrant dropped — persistent local-mode file-lock issues, not worth the remaining risk this close to deadline
 DEFAULT_EMBED_MODEL = "bge-small-en-v1.5"
 DEFAULT_ENGINE = "FAISS"
 CHUNK_SIZE     = 750
 CHUNK_OVERLAP  = 100
-
-# Module-level cache for loaded vectorstores — mirrors server.py's _cache pattern.
-# Persists across Streamlit reruns within the same process (not across separate users).
-_vs_cache = {}
 
 def get_isolated_paths(model_folder):
     """Index folder paths for a given embedding model — one FAISS/Chroma/Qdrant
@@ -75,7 +71,7 @@ GREETINGS = ["hi", "hello", "hey", "how are you", "good morning", "good evening"
 FAREWELLS = ["bye", "goodbye", "exit", "quit", "see you", "take care", "thanks", "thank you"]
 GUARDRAIL_PHRASE = "I cannot find sufficient verified data within the loaded documents."
 
-st.set_page_config(page_title="Offline Fact-Verification", layout="centered")
+st.set_page_config(page_title="Offline Fact Verification System", layout="centered")
 
 st.markdown("""
 <style>
@@ -195,18 +191,13 @@ def force_remove(path):
         shutil.rmtree(path, onerror=handle_error)
 
 def clear_vectorstore_cache():
-    """Release all cached vectorstore objects and flush DB connection pools before rebuilding —
-    ported from server.py exactly. Must run before rebuild or Qdrant/Chroma throw file-lock errors:
-    Qdrant holds an OS-level exclusive lock on its folder, Chroma holds a class-level SQLite pool."""
-    for key in list(_vs_cache.keys()):
-        store = _vs_cache.get(key)
-        if store is not None:
-            try:
-                if hasattr(store, "_client"):
-                    store._client.close()
-            except Exception:
-                pass
-            _vs_cache[key] = None
+    """Release all cached vectorstore objects and flush DB connection pools before rebuilding.
+    Must run before rebuild or Qdrant/Chroma throw file-lock errors: Qdrant holds an OS-level
+    exclusive lock on its folder, Chroma holds a class-level SQLite pool."""
+    try:
+        load_vectorstore.clear()   # wipes Streamlit's actual resource cache — releases held clients
+    except Exception:
+        pass
     try:
         import chromadb
         chromadb.api.client.SharedSystemClient.clear_system_cache()
@@ -231,10 +222,7 @@ def _build_indexes_for_model(model_folder, embeddings, chunks):
         Chroma.from_documents(chunks, embeddings, persist_directory=paths["chroma"])
     except Exception as e:
         raise RuntimeError(f"Chroma build failed for {model_folder}: {e}") from e
-    try:
-        QdrantVectorStore.from_documents(chunks, embeddings, path=paths["qdrant"], collection_name="rag_docs")
-    except Exception as e:
-        raise RuntimeError(f"Qdrant build failed for {model_folder}: {e}") from e
+    # Qdrant build skipped — dropped from ALL_ENGINES, not built or loaded anymore.
 
 def rebuild_all_indexes():
     """Rebuild FAISS + Chroma + Qdrant indexes for ALL three embedding models — ported from
@@ -260,23 +248,22 @@ def rebuild_all_indexes():
     return True
 
 def all_indexes_exist():
-    """Check that indexes for all three embedding models (all engines) exist on disk."""
+    """Check that indexes for all three embedding models (FAISS + Chroma) exist on disk."""
     try:
         for m in ALL_MODELS:
             p = get_isolated_paths(m)
             if not os.path.exists(p["faiss_file"]): return False
             if not os.path.exists(p["chroma_file"]): return False
-            if not os.path.exists(p["qdrant"]) or len(os.listdir(p["qdrant"])) == 0: return False
         return True
     except Exception:
         return False
 
+@st.cache_resource
 def load_vectorstore(engine, model_folder):
-    """Load vectorstore from disk, caching it so repeated dropdown switches don't reload from disk
-    every time — ported from server.py's load_vectorstore() exactly."""
-    key = f"vectorstore_{engine}_{model_folder}"
-    if _vs_cache.get(key) is not None:
-        return _vs_cache[key]
+    """Load vectorstore from disk, cached by Streamlit's own resource cache — this is what
+    actually survives dropdown switches (a plain module-level dict does NOT, since Streamlit
+    re-runs the whole script top-to-bottom on every interaction, silently resetting any
+    ordinary global variable). Cached separately per (engine, model_folder) combination."""
     paths = get_isolated_paths(model_folder)
     embeddings = get_embeddings(model_folder)
     try:
@@ -291,7 +278,6 @@ def load_vectorstore(engine, model_folder):
     except Exception as e:
         st.error(f"Could not load {engine} index for {model_folder}: {e}. Click Rebuild.")
         return None
-    _vs_cache[key] = store
     return store
 
 # ---------------------------------------------------------------------------
@@ -458,7 +444,7 @@ Steps:
 2. Compare claims only within the SAME scope across chunks. Verify the numbers are actually different before flagging.
 3. Decide ONCE: either contradictions exist, or they don't.
 4. If NONE exist, your ENTIRE response must be exactly: "No contradictions detected across the retrieved chunks." — nothing else, no lists, no explanation.
-5. If real contradictions exist, your ENTIRE response must be ONLY the list, in this format: "Chunk X vs Chunk Y: [conflicting values, same scope] — [why they cannot both be true]" — do NOT add the "No contradictions detected" line anywhere if you are listing real conflicts.
+5. If real contradictions exist, list ONLY those — do not also include the "No contradictions detected" line. This is shown directly to a person reading quickly — keep it SHORT. For each conflict, use ONE line, this exact format: "Chunk X vs Chunk Y: [value A] vs [value B] — [same scope, in 5 words or fewer]". No extra sentences, no restating the full chunk text, no "why they cannot both be true" essay — the two conflicting values ARE the explanation. Maximum 4 lines total, even if more exist — list the 4 clearest conflicts only.
 
 Chunks:
 {chunks}
@@ -477,8 +463,11 @@ Contradiction Analysis:"""
 
     return result
 
-def run_synthesizer(question, draft_answer, verification, contradiction_report, model_name, grounding_score=None):
-    """Stage 4 — compiles everything into one final, clean, cited report for the user."""
+def run_synthesizer(question, draft_answer, verification, model_name, grounding_score=None):
+    """Stage 4 — compiles the draft + verification into one final, clean, cited report.
+    Contradiction Check runs and displays separately — its findings are shown to the user
+    directly in its own stage box, not blended into this prose, since that blending was
+    producing unreliable phrasing when the underlying flag was itself a false positive."""
     grounding_note = (
         f"\n\nAutomated grounding score (independent embedding-similarity check, 0.0-1.0, "
         f"higher = better math-verified match between claim and evidence): {grounding_score:.2f}"
@@ -489,12 +478,11 @@ def run_synthesizer(question, draft_answer, verification, contradiction_report, 
 Operational Rules:
 1. Base your final answer on the Draft Answer, adjusted per the Verification findings.
 2. If Verification flagged something as NOT SUPPORTED, remove or clearly caveat it in the final answer — do not present unsupported claims as fact.
-3. If the Contradiction Analysis found conflicts, add a short "Note" at the end flagging this to the user.
-4. Check the Draft Answer for FABRICATED CONNECTIONS: if it links two separately-true facts together in a way not explicitly stated in the Evidence (e.g. combining a general rule with an unrelated threshold or condition), flag this explicitly in your Note — even if each individual fact was separately marked SUPPORTED.
-5. If the Original Question asks about something more specific than what the documents cover (e.g. asks about a sub-category that the documents only address generally), say so plainly instead of implying a specific rule exists.
-6. An automated grounding score (independent embedding-similarity math, not the LLM's opinion) is provided below if available. If this score is LOW (below 0.4) but the Verification's self-reported confidence was High, trust the grounding score more — lower your final confidence level and add a note that the automated check found weaker support than the self-assessment suggested.
-7. ALWAYS end with a line in this EXACT format: "Confidence Level: [High/Medium/Low] (X.X)" — where X.X is the numeric score from Verification, adjusted per rule 6 if applicable. Never omit the number. If Verification was skipped, omit this line entirely.
-8. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
+3. Check the Draft Answer for FABRICATED CONNECTIONS: if it links two separately-true facts together in a way not explicitly stated in the Evidence (e.g. combining a general rule with an unrelated threshold or condition), flag this explicitly in your Note — even if each individual fact was separately marked SUPPORTED.
+4. If the Original Question asks about something more specific than what the documents cover (e.g. asks about a sub-category that the documents only address generally), say so plainly instead of implying a specific rule exists.
+5. An automated grounding score (independent embedding-similarity math, not the LLM's opinion) is provided below if available. If this score is LOW (below 0.4) but the Verification's self-reported confidence was High, trust the grounding score more — lower your final confidence level and add a note that the automated check found weaker support than the self-assessment suggested.
+6. ALWAYS end with a line in this EXACT format: "Confidence Level: [High/Medium/Low] (X.X)" — where X.X is the numeric score from Verification, adjusted per rule 5 if applicable. Never omit the number. If Verification was skipped, omit this line entirely.
+7. Keep it concise, well-structured, and objective. Do not repeat the raw verification text — synthesize it.
 
 Original Question:
 {question}
@@ -505,16 +493,13 @@ Draft Answer:
 Verification Findings:
 {verification}{grounding_note}
 
-Contradiction Analysis:
-{contradiction}
-
 Final Answer:"""
-    prompt = PromptTemplate(template=prompt_template, input_variables=["question", "draft", "verification", "contradiction", "grounding_note"])
+    prompt = PromptTemplate(template=prompt_template, input_variables=["question", "draft", "verification", "grounding_note"])
     llm = OllamaLLM(model=model_name, temperature=0.2)
     chain = prompt | llm | StrOutputParser()
     return chain.invoke({
         "question": question, "draft": draft_answer,
-        "verification": verification, "contradiction": contradiction_report,
+        "verification": verification,
         "grounding_note": grounding_note,
     })
 
@@ -586,7 +571,8 @@ with st.sidebar:
         default_idx = available_llms.index("gemma3:4b") if "gemma3:4b" in available_llms else 0
         selected_model = st.selectbox(
             "Select Language Model", available_llms, index=default_idx,
-            disabled=st.session_state.generating
+            disabled=st.session_state.generating,
+            help="Same model runs all 4 pipeline stages — switching here changes every stage at once."
         )
 
     # Only offer embedding models that actually have local weights downloaded
@@ -855,7 +841,7 @@ if question:
                                 status23.update(label="Stage 2+3 — Verifier & Contradiction check: complete", state="complete")
 
                             with st.status("Synthesizing final report...", expanded=True) as status4:
-                                final_answer = run_synthesizer(question, draft_answer, verification, contradiction_report, selected_model, grounding_score)
+                                final_answer = run_synthesizer(question, draft_answer, verification, selected_model, grounding_score)
                                 status4.update(label="Stage 4 — Synthesizer: report ready", state="complete")
 
                         if guardrail_triggered:
