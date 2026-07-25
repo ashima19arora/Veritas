@@ -5,6 +5,8 @@ Every answer is researched, independently verified, checked for contradictions, 
 
 **Veritas** is Latin for _truth_. That's the whole premise of this project: an AI system that doesn't just answer confidently, but actually checks whether it's earned the right to.
 
+**Full build story, bugs, and fixes:** [veritas-devlog.netlify.app](https://veritas-devlog.netlify.app/)
+
 ---
 
 ## Built for
@@ -80,16 +82,21 @@ No single stage's output is final until something else has checked it.
 - **Ollama** installed and running on your machine, with at least one model pulled (e.g. `ollama pull gemma3:4b`)
 - **Docker Desktop** installed, if using Option A. On Windows, Docker Desktop requires **WSL2** (Windows Subsystem for Linux) — if you haven't set this up before, Docker Desktop will prompt you to enable it on first install, or see [Microsoft's WSL2 install guide](https://learn.microsoft.com/en-us/windows/wsl/install). Make sure Docker Desktop is fully started (not just launching) before proceeding.
 
+> **Note on large files:** the pre-built Docker image and the embedding model weights both exceed GitHub's 100MB file size limit, so they're hosted separately rather than committed to this repository:
+>
+> - **Pre-built Docker image (`veritas.tar`):** [Download](https://drive.google.com/file/d/1Q5uTmj70zxJCS4D1mAJwccXKXFNBd4Nf/view?usp=sharing)
+> - **Embedding models (`models.zip`):** [Download](https://drive.google.com/file/d/1IlfI9FE9tPYQUswdGgnRhIlmXY4VcmaT/view?usp=sharing)
+
 ### Option A — Docker (recommended)
 
-**A1. Build the image yourself:**
+**A1. Build the image yourself** (embedding models get baked in automatically during the build, no manual download needed for this path):
 
 ```bash
 docker build -t veritas .
 docker run -p 8501:8501 veritas
 ```
 
-**A2. Or load the pre-built image** — a `veritas.tar` file is included in this repository, so no build step is needed:
+**A2. Or skip the build — download the pre-built image instead** (link above), then:
 
 ```bash
 docker load -i veritas.tar
@@ -111,7 +118,7 @@ ollama pull gemma3:4b
 streamlit run streamlit_app.py
 ```
 
-A `models/` folder with the embedding weights already downloaded is included in this repository — no separate download step needed, the app runs fully offline from the first launch.
+Download `models.zip` (link above) and extract it into the project root as a `models/` folder before running — this contains the embedding model weights needed to run fully offline from the first launch.
 
 ---
 

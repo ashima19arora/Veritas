@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VERITAS — Developer's Journal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Newsreader:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #0b0d0c;
+    --bg-raised: #101312;
+    --line: #222723;
+    --ink: #e7e9e4;
+    --ink-dim: #9aa39a;
+    --ink-faint: #5c655c;
+    --verdict-green: #7fd88f;
+    --verdict-amber: #e0b15c;
+    --verdict-red: #d9705f;
+    --accent: #7fd88f;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --serif: 'Newsreader', Georgia, serif;
+  }
+  *{ box-sizing: border-box; }
+  html{ scroll-behavior: smooth; }
+  body{
+    margin:0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--mono);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection{ background: var(--verdict-green); color: #0b0d0c; }
+  a{ color: inherit; }
+  body::before{
+    content:"";
+    position: fixed; inset:0;
+    pointer-events:none;
+    background-image: repeating-linear-gradient(
+      to bottom, rgba(255,255,255,0.014) 0px, rgba(255,255,255,0.014) 1px,
+      transparent 1px, transparent 3px
+    );
+    z-index: 1;
+    mix-blend-mode: overlay;
+  }
+  .wrap{ max-width: 920px; margin: 0 auto; padding: 0 28px; }
+  nav{
+    position: sticky; top:0; z-index: 50;
+    background: rgba(11,13,12,0.86);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  nav .wrap{
+    display:flex; align-items:center; justify-content: space-between;
+    height: 56px; max-width: 1080px;
+  }
+  .nav-mark{ font-weight:700; font-size: 13px; letter-spacing: 0.14em; color: var(--ink); }
+  .nav-mark span{ color: var(--verdict-green); }
+  .nav-links{ display:flex; gap: 22px; font-size: 12px; color: var(--ink-dim); }
+  .nav-links a{ text-decoration:none; letter-spacing: 0.04em; }
+  .nav-links a:hover{ color: var(--verdict-green); }
+  .nav-status{ display:flex; align-items:center; gap:7px; font-size: 11px; color: var(--ink-faint); }
+  .dot{ width:6px; height:6px; border-radius:50%; background: var(--verdict-green); box-shadow: 0 0 8px var(--verdict-green); animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.35} }
+  header.hero{ max-width: 1080px; margin: 0 auto; padding: 100px 28px 40px; border-bottom: 1px solid var(--line); }
+  .eyebrow{ font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-faint); display:flex; align-items:center; gap: 10px; margin-bottom: 28px; }
+  .eyebrow::before{ content:"//"; color: var(--verdict-green); }
+  h1.title{ font-family: var(--mono); font-weight: 700; font-size: clamp(52px, 9vw, 108px); letter-spacing: -0.02em; line-height: 0.95; margin: 0 0 6px; color: var(--ink); }
+  h1.title .dim{ color: var(--ink-faint); }
+  .subtitle{ font-family: var(--serif); font-style: italic; font-weight: 400; font-size: clamp(19px, 2.4vw, 26px); color: var(--ink-dim); max-width: 640px; margin: 18px 0 40px; line-height: 1.5; }
+  .hero-meta{ display:flex; flex-wrap:wrap; gap: 40px; border-top: 1px solid var(--line); padding-top: 20px; margin-top: 16px; }
+  .hm-label{ font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 6px; }
+  .hm-value{ font-size: 15px; color: var(--ink); }
+  .hm-value.accent{ color: var(--verdict-green); }
+  section{ max-width: 1080px; margin: 0 auto; padding: 90px 28px; border-bottom: 1px solid var(--line); position: relative; }
+  section:last-of-type{ border-bottom: none; }
+  .sec-head{ display:flex; align-items: baseline; gap: 18px; margin-bottom: 48px; }
+  .sec-num{ font-size: 12px; color: var(--verdict-green); letter-spacing: 0.1em; }
+  .sec-title{ font-size: clamp(26px, 4vw, 38px); font-weight: 700; letter-spacing: -0.01em; margin:0; }
+  .sec-line{ flex:1; height:1px; background: var(--line); align-self:center; }
+  .sec-kicker{ color: var(--ink-faint); font-size: 12.5px; max-width: 560px; margin: -30px 0 40px; line-height: 1.6; }
+  .journal{ position: relative; }
+  .journal::before{ content:""; position:absolute; left: 14px; top: 8px; bottom: 8px; width:1px; background: linear-gradient(to bottom, var(--verdict-green), var(--line) 90%); }
+  .entry{ position: relative; padding-left: 46px; margin-bottom: 54px; }
+  .entry-dot{ position:absolute; left: 9px; top: 3px; width: 11px; height: 11px; border-radius: 50%; background: var(--bg); border: 2px solid var(--verdict-green); z-index: 2; }
+  .entry.milestone .entry-dot{ background: var(--verdict-green); box-shadow: 0 0 10px var(--verdict-green); }
+  .entry-tag{ display:inline-block; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--verdict-green); border: 1px solid rgba(127,216,143,0.35); border-radius: 20px; padding: 3px 10px; margin-bottom: 10px; }
+  .entry h3{ font-size: 20px; margin: 0 0 12px; font-weight: 600; letter-spacing: -0.01em; }
+  .entry ul{ margin: 0; padding-left: 18px; color: #d4dad1; font-size: 15.5px; line-height: 1.85; }
+  .entry ul li{ margin-bottom: 9px; }
+  .entry ul li::marker{ color: var(--ink-faint); }
+  .entry p.lead{ color: var(--ink-dim); font-size: 15.5px; line-height: 1.8; margin: 0 0 16px; }
+  code, .k{ font-family: var(--mono); background: rgba(127,216,143,0.08); color: var(--verdict-green); padding: 1px 6px; border-radius: 3px; font-size: 0.9em; border: 1px solid rgba(127,216,143,0.15); }
+  .commit{ font-size: 12px; color: var(--ink-faint); margin-top: 12px; display:inline-flex; align-items:center; gap:6px; }
+  .commit::before{ content:"⎇"; color: var(--verdict-green); }
+  .bug{ margin-top: 14px; border-left: 2px solid var(--verdict-red); background: rgba(217,112,95,0.06); padding: 12px 16px; border-radius: 0 3px 3px 0; }
+  .bug .bug-head{ font-size: 11.5px; letter-spacing: 0.06em; color: var(--verdict-red); font-weight:700; margin-bottom: 5px; text-transform: uppercase;}
+  .bug p{ margin: 3px 0; font-size: 14.5px; color: #d4dad1; line-height: 1.7; }
+  .bug .fix{ color: #d4dad1; }
+  .bug .fix::before{ content: "→ fix: "; color: #d4dad1; }
+  .openissue{ margin-top: 14px; border-left: 2px solid var(--verdict-amber); background: rgba(224,177,92,0.06); padding: 12px 16px; border-radius: 0 3px 3px 0; }
+  .openissue .oi-head{ font-size: 11.5px; letter-spacing: 0.06em; color: var(--verdict-amber); font-weight:700; margin-bottom: 5px; text-transform: uppercase;}
+  .openissue p{ margin: 3px 0; font-size: 13.5px; color: #c4cbc2; line-height: 1.6; }
+  .status-card{ margin-left: 46px; margin-top: -10px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; padding: 22px 24px; }
+  .status-card .sc-title{ font-size: 13px; color: var(--verdict-green); font-weight: 700; margin-bottom: 12px; letter-spacing: 0.03em; }
+  .checks{ display:grid; grid-template-columns: repeat(2, 1fr); gap: 8px 20px; }
+  .checks div{ font-size: 13px; color: var(--ink-dim); display:flex; gap:8px; align-items:flex-start; }
+  .checks div::before{ content:"✓"; color: var(--verdict-green); flex-shrink:0; }
+  @media (max-width: 560px){ .checks{ grid-template-columns: 1fr; } }
+  .next-list{ margin-left: 46px; }
+  .next-list ol{ counter-reset: step; list-style:none; margin:0; padding:0; }
+  .next-list li{ counter-increment: step; display:flex; gap:14px; padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; color: var(--ink-dim); }
+  .next-list li:last-child{ border-bottom:none; }
+  .next-list li::before{ content: counter(step); color: var(--ink-faint); font-weight:700; width: 20px; flex-shrink:0; }
+  .stack-grid{ display:grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+  @media (max-width: 780px){ .stack-grid{ grid-template-columns: repeat(2,1fr); } }
+  @media (max-width: 460px){ .stack-grid{ grid-template-columns: 1fr; } }
+  .stack-item{ background: var(--bg-raised); padding: 20px 18px; transition: background .15s; }
+  .stack-item:hover{ background: #141814; }
+  .stack-item .si-role{ font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 8px; }
+  .stack-item .si-name{ font-size: 15px; color: var(--ink); font-weight: 600; margin-bottom: 4px; }
+  .stack-item .si-detail{ font-size: 12px; color: var(--ink-dim); line-height: 1.5; }
+  .arch-wrap{ background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; padding: 36px 20px; overflow-x: auto; }
+  .arch-caption{ text-align:center; font-size: 12px; color: var(--ink-faint); margin-top: 18px; }
+  .arch-legend{ display:flex; gap: 22px; justify-content:center; margin-top: 18px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-dim); }
+  .arch-legend span{ display:inline-flex; align-items:center; gap:6px; }
+  .legend-swatch{ width:10px; height:10px; border-radius:2px; display:inline-block; }
+  footer{ max-width: 1080px; margin: 0 auto; padding: 50px 28px 70px; }
+  .footer-row{ display:flex; justify-content: space-between; align-items:center; flex-wrap: wrap; gap: 16px; }
+  .footer-mark{ font-size: 12px; color: var(--ink-faint); }
+  .footer-team{ font-size: 12px; color: var(--ink-faint); }
+  .footer-team .fill{ color: var(--ink-dim); border-bottom: 1px dashed var(--ink-faint); }
+  ::-webkit-scrollbar{ width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track{ background: var(--bg); }
+  ::-webkit-scrollbar-thumb{ background: var(--line); border-radius: 5px; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="nav-mark">VERI<span>TAS</span></div>
+    <div class="nav-links">
+      <a href="#motive">Motive</a>
+      <a href="#journal">Journal</a>
+      <a href="#stack">Stack</a>
+      <a href="#architecture">Architecture</a>
+    </div>
+    <div class="nav-status"><span class="dot"></span> log: complete</div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="eyebrow">Innova Hack Chapter-1 · Domain 3, Gen AI · Problem Statement 1</div>
+  <h1 class="title">VERI<span class="dim">TAS</span></h1>
+  <p class="subtitle">An offline, multi-agent research system that researches, verifies, cross-checks, and cites itself — before it ever shows you an answer.</p>
+
+  <div class="hero-meta">
+    <div>
+      <div class="hm-label">Problem statement</div>
+      <div class="hm-value">Autonomous multi-agent research &amp; fact-verification</div>
+    </div>
+    <div>
+      <div class="hm-label">Build window</div>
+      <div class="hm-value">July 25 – 26, 2026</div>
+    </div>
+  </div>
+</header>
+
+<section id="motive">
+  <div class="sec-head"><span class="sec-num">01</span><h2 class="sec-title">Why this, and why like this</h2><div class="sec-line"></div></div>
+  <div style="max-width: 720px;">
+    <p style="font-family: var(--serif); font-size: 18px; line-height: 1.75; color: #cfd4cc; margin: 0 0 20px;">Generative models are confident narrators — fluent and certain whether they're right or not, which is the actual reason people hesitate to fully trust a chatbot's answer. We built it fully offline on purpose. Research papers and internal documents are often sensitive — they shouldn't be uploaded to a cloud LLM or sent through an external API call just to get a summary. Everything here runs through Ollama, locally, on the machine in front of you. No document content, no query, nothing ever leaves that machine. The theory hook came from a research paper we'd read on interactive proof systems, the idea of a Prover generating claims and a Verifier independently checking them — that split is where our Researcher/Verifier agents come from.</p>
+  </div>
+</section>
+
+<section id="journal">
+  <div class="sec-head"><span class="sec-num">02</span><h2 class="sec-title">Dev Log</h2><div class="sec-line"></div></div>
+  <p style="font-family: var(--mono); font-style: normal; font-size: 14px; color: var(--ink-dim); max-width: 640px; margin: -30px 0 40px; line-height: 1.7;">The birth of VERITAS, logged as it happened. Every system starts as a blank repo and a deadline — this is the record of how this one got its shape: what worked on the first try, what broke, and what got fixed at 2am.</p>
+
+  <div class="journal">
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Kickoff</span>
+      <h3>Picking the problem</h3>
+      <ul>
+        <li>Reviewed all 5 domain problem statements — picked Gen AI PS1: Autonomous Multi-Agent Research &amp; Fact-Verification System</li>
+        <li>What made it interesting: hallucination isn't a random glitch — it is a genuinely open problem in how these models work</li>
+        <li>Theory hook decided early: interactive proof systems, Prover generates and Verifier checks, mapped onto a Researcher/Verifier agent split</li>
+      </ul>
+    </div>
+
+    <div class="entry">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Setup</span>
+      <h3>Repo &amp; naming</h3>
+      <ul>
+        <li>Created the GitHub repo, local folder, <code>git init</code></li>
+        <li><code>.gitignore</code> set up early to exclude <code>models/</code>, <code>docs/</code>, <code>vectorstore_index/</code> — binary weights and generated indexes have no business in version control</li>
+        <li>Named the project <strong>VERITAS</strong> — Latin for "truth." Also very close to "Veritaserum," the truth potion from Harry Potter — a small, deliberate nod that stuck once we noticed it.</li>
+      </ul>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Layer 1</span>
+      <h3>Single-file offline RAG</h3>
+      <p class="lead">Goal before anything clever: prove the boring path works end to end — upload a document, ask a question, get a grounded answer, entirely offline. No fancy agent behavior yet, just the retrieval loop itself, working.</p>
+      <ul>
+        <li>Single-file Streamlit app on purpose — one file to reason about, no server/container split eating hours before the core loop is even proven</li>
+        <li>Chunking via <code>RecursiveCharacterTextSplitter</code>, 750 characters with 100 character overlap — the overlap exists specifically so a sentence sliced at a chunk boundary still appears whole in at least one of the two adjacent chunks</li>
+        <li><code>bge-small-en-v1.5</code> as the embedding model, loaded locally — converts each chunk into a vector, a fixed-length list of numbers standing in for its meaning. No understanding of language happening here, just a fast, purely geometric comparison: closer vectors mean closer meaning</li>
+        <li>FAISS as the vector store — lowest latency, nothing extra to run alongside it, holds the vectors and searches them fast</li>
+        <li>Strict guardrail prompt: if the answer isn't grounded in retrieved context, the model has to say so instead of guessing</li>
+      </ul>
+      <div class="bug">
+        <div class="bug-head">Bug — offline embedding load</div>
+        <p>First run tried to pull the embedding model from HuggingFace Hub on start — crashed immediately with a connection error, since the whole point is no internet.</p>
+        <p class="fix">Pointed the loader at a local <code>models/bge-small-en-v1.5/</code> folder instead, loaded straight from disk.</p>
+      </div>
+      <div class="bug">
+        <div class="bug-head">Bug — noisy terminal</div>
+        <p>Streamlit's file watcher kept scanning unrelated transformer submodules and spamming missing-import warnings for <code>torchvision</code>, drowning out real logs.</p>
+        <p class="fix">Installed <code>torchvision</code> directly rather than disabling the watcher — kept auto-reload working during the rest of the build.</p>
+      </div>
+      <div class="commit">Layer 1 confirmed working — real document, real question, real guardrail trigger, committed to GitHub</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Layer 2</span>
+      <h3>The multi-agent pipeline</h3>
+      <p class="lead">One model, four roles, each stage checking the one before it.</p>
+      <ul>
+        <li>Built all four stage functions — Researcher, Verifier, Contradiction Check, Synthesizer — wired into live <code>st.status()</code> boxes so the pipeline stays visible while it runs</li>
+        <li>Retrieval is currently similarity-only (top 15 by vector distance). A proper cross-encoder rerank is on the Layer 3 list, not done yet</li>
+        <li>Guardrail-skip: if the Researcher finds nothing grounded, Stages 2 and 3 never run</li>
+        <li>Verifier and Contradiction Check run concurrently — neither depends on the other, only on the Researcher</li>
+      </ul>
+
+      <ul style="margin-top:16px;">
+        <li>Confidence score now reflects the weakest claim in an answer, not an average — one unsupported claim caps the whole score</li>
+        <li>Exception handling added for password-protected, corrupted, and empty files — surfaced by filename instead of silently dropped</li>
+        <li>Full stage history persists — scrolling back up still shows the old breakdown, not just the final answer</li>
+      </ul>
+      <div class="commit">Layer 2 milestone committed to GitHub</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Status</span>
+      <h3>Layer 2 — stable</h3>
+      <div class="status-card">
+        <div class="sc-title">Confirmed via structured test cases</div>
+        <div class="checks">
+          <div>Guardrail skip on empty retrieval</div>
+          <div>Cross-document comparison accuracy</div>
+          <div>Contradiction detection accuracy</div>
+          <div>Confidence scoring reflects weakest claim</div>
+          <div>Persisted stage history across questions</div>
+          <div>Multi-file upload &amp; deletion</div>
+          <div>Exception handling on bad files</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Layer 3</span>
+      <h3>Retrieval accuracy, citations, and grounding</h3>
+      <p class="lead">Four batches, tested and confirmed working before moving to the next. Everything below actually shipped.</p>
+      <ul>
+        <li><strong>FlashRank cross-encoder rerank</strong> — retrieval upgraded to a real two-stage pipeline: 15 candidates by similarity, re-scored by a small local cross-encoder for true relevance, top results kept</li>
+        <li><strong>Source citations per claim</strong> — every answer ends with a Sources line (doc name + page number), built directly from retrieved chunks in code — so a citation can't be hallucinated</li>
+        <li><strong>Objective grounding check</strong> — each claim and its cited evidence both get embedded, and their similarity is computed mathematically — a real check, not the model's opinion of itself</li>
+        <li><strong>Multiple embedding models</strong> — three models selectable, each with its own isolated index</li>
+      </ul>
+      <div class="commit">Layer 3 batches 1–3 committed to GitHub</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Layer 3 — final batch</span>
+      <h3>Multiple vector engines</h3>
+      <p class="lead">FAISS and Chroma, both selectable alongside the three embedding models. One Rebuild builds every combination at once, so switching either dropdown afterward is instant — no reprocessing wait.</p>
+      <ul>
+        <li>Multi-LLM tested across the same question set — the largest local model correctly declined an out-of-scope question every time; the smallest model occasionally fabricated an answer instead</li>
+        <li>A third vector engine (Qdrant) was evaluated and ultimately dropped — its local-file locking proved too fragile to fully stabilize in the time remaining</li>
+      </ul>
+      <div class="commit">Layer 3 complete — committed to GitHub</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Final push</span>
+      <h3>Testing, polish, submission prep</h3>
+      <p class="lead">The last stretch — no new features, just making sure everything already built actually holds up.</p>
+      <ul>
+        <li>Full structured test pass across every stage: guardrail accuracy on out-of-scope questions, fabrication resistance, contradiction accuracy, citation correctness, cross-document comparisons, and file upload/delete</li>
+        <li>Repeated stress-testing of the embedding-model and vector-engine switch — the exact scenario that caused instability earlier — confirmed stable across rapid switching with no lock errors</li>
+        <li>UI pass: consistent help text across every dropdown, cleaner caption formatting, exact branding wording finalized</li>
+      </ul>
+
+      <div class="bug">
+        <div class="bug-head">Late catch — Contradiction Check leaking into the final answer</div>
+        <p>A last round of testing surfaced the Contradiction Checker occasionally flagging things that weren't real conflicts — two sentences emphasizing different aspects of the same topic, not actually incompatible claims. Worse, this had started leaking into the Synthesizer's final wording, not just staying in its own section.</p>
+        <p class="fix">Decoupled it — the Contradiction Checker still runs, still shown live in its own section, satisfying the requirement in full. But its output no longer feeds into the Synthesizer, so a borderline flag can never quietly reshape the final answer's wording. Its output was also shortened — capped at the clearest few conflicts, one line each — since it no longer needs to be detailed enough for another stage to parse, just clear enough for a person to read at a glance.</p>
+      </div>
+
+      <div class="commit">Decoupling shipped, committed to GitHub</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Deployment</span>
+      <h3>Containerized</h3>
+      <p class="lead">Packaged into a single Docker image for a reproducible, one-command setup — no manual Python environment wrangling required.</p>
+      <ul>
+        <li>Base image pinned to an exact version rather than a moving "latest" tag — the specific fix for version-drift pain encountered on an earlier offline-RAG build</li>
+        <li>Embedding weights, app code, and Streamlit config all baked directly into the image — runs immediately after <code>docker compose up</code>, no separate download or setup step</li>
+        <li>Documents and the vector index persist outside the container via mounted volumes, so they survive a container restart instead of resetting each time</li>
+      </ul>
+      <div class="commit">Image built successfully — 6GB initial size</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Final bug hunt</span>
+      <h3>Getting the container actually right</h3>
+      <p class="lead">A built image is not the same as a correct one. Running it surfaced three more real issues, each fixed and verified before calling this done.</p>
+
+      <div class="bug">
+        <div class="bug-head">CPU spike on the largest embedding model</div>
+        <p>The largest of the three embedding models spiked CPU usage dramatically and took far too long for a live demo — an experience judges would have hit directly.</p>
+        <p class="fix">Dropped it. Two well-tested, fast models beat three where one makes the demo unusable. Image size dropped from roughly 6GB to under 4GB as a direct side effect.</p>
+      </div>
+
+      <div class="bug">
+        <div class="bug-head">Silently not offline</div>
+        <p>Despite the whole premise being air-gapped operation, the app was still quietly reaching out to the internet — the embedding library checks for update metadata by default unless explicitly told not to, even when a valid local copy of the model already exists. Invisible with Wi-Fi on, and exactly the kind of gap a judge testing offline-only would hit immediately.</p>
+        <p class="fix">Forced the relevant libraries into offline mode explicitly, at both the code level and the container level — belt and suspenders, so it can't be missed a second time.</p>
+      </div>
+
+      <div class="bug">
+        <div class="bug-head">Confusing error instead of a clean message</div>
+        <p>Asking a question before any documents were uploaded surfaced a raw internal file-not-found error instead of a plain "no documents yet" message.</p>
+        <p class="fix">Added an upfront check, and disabled the question box entirely until an index actually exists — prevention instead of an after-the-fact error message.</p>
+      </div>
+
+      <div class="commit">Rebuilt, verified working with the network disabled — the real test</div>
+    </div>
+
+    <div class="entry milestone">
+      <div class="entry-dot"></div>
+      <span class="entry-tag">Submitted</span>
+      <h3>Project complete</h3>
+      <p class="lead">Everything planned across four layers is built, tested, documented, and containerized — and genuinely confirmed working offline, not just assumed to be. README, this dev log, and the architecture diagram are all finalized for submission.</p>
+    </div>
+
+  </div>
+</section>
+
+<section id="stack">
+  <div class="sec-head"><span class="sec-num">03</span><h2 class="sec-title">Tech stack</h2><div class="sec-line"></div></div>
+  <p class="sec-kicker">Everything below shipped in the build above — nothing here is aspirational.</p>
+  <div class="stack-grid">
+    <div class="stack-item"><div class="si-role">Language</div><div class="si-name">Python</div><div class="si-detail">Core pipeline &amp; app logic</div></div>
+    <div class="stack-item"><div class="si-role">Interface</div><div class="si-name">Streamlit</div><div class="si-detail">Single-file UI, live status boxes</div></div>
+    <div class="stack-item"><div class="si-role">Orchestration</div><div class="si-name">LangChain</div><div class="si-detail">Prompt chaining, doc loaders, splitting</div></div>
+    <div class="stack-item"><div class="si-role">Inference</div><div class="si-name">Ollama</div><div class="si-detail">Fully local LLM runtime</div></div>
+    <div class="stack-item"><div class="si-role">Model</div><div class="si-name">Gemma / Phi / Llama</div><div class="si-detail">Selectable, same 4-stage pipeline for each</div></div>
+    <div class="stack-item"><div class="si-role">Embeddings</div><div class="si-name">3 models, selectable</div><div class="si-detail">Local weights, no Hub call</div></div>
+    <div class="stack-item"><div class="si-role">Vector store</div><div class="si-name">FAISS / Chroma</div><div class="si-detail">Selectable, both pre-built together</div></div>
+    <div class="stack-item"><div class="si-role">Chunking</div><div class="si-name">RecursiveCharacterTextSplitter</div><div class="si-detail">750 chars, 100 overlap</div></div>
+    <div class="stack-item"><div class="si-role">Concurrency</div><div class="si-name">ThreadPoolExecutor</div><div class="si-detail">Parallel Verifier + Contradiction stages</div></div>
+    <div class="stack-item"><div class="si-role">Formats</div><div class="si-name">PDF · DOCX · DOC · TXT</div><div class="si-detail">Multi-file upload &amp; indexing</div></div>
+    <div class="stack-item"><div class="si-role">Versioning</div><div class="si-name">Git / GitHub</div><div class="si-detail">Milestone commits per layer</div></div>
+    <div class="stack-item"><div class="si-role">Runtime mode</div><div class="si-name">Fully offline</div><div class="si-detail">Zero cloud LLM calls</div></div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="sec-head"><span class="sec-num">04</span><h2 class="sec-title">The pipeline</h2><div class="sec-line"></div></div>
+  <p class="sec-kicker">One model, four jobs. Verifier and Contradiction Check never see each other's output — only the Researcher's — so they run at the same time.</p>
+
+  <div class="arch-wrap" style="text-align:center;">
+    <img src="images/pipeline_diagram.png" alt="VERITAS four-stage pipeline diagram" style="max-width:100%; border-radius:4px;">
+  </div>
+  <p class="arch-caption">Same underlying model called up to four times per question — each call a different role, not a different model.</p>
+</section>
+
+<footer>
+  <div class="footer-row">
+    <div class="footer-mark">VERITAS · Innova Hack Chapter-1 · Domain 3</div>
+    <div class="footer-team">Team: <span class="fill">Compil(h)er</span></div>
+  </div>
+</footer>
+
+</body>
+</html>
