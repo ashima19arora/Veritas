@@ -11,3 +11,7 @@ docx2txt
 sentence-transformers
 ollama
 torchvision
+flashrank
+chromadb
+langchain-qdrant
+qdrant-client

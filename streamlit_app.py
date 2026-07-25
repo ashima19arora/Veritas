@@ -25,11 +25,15 @@ import time
 import re
 import numpy as np
 import concurrent.futures
+import shutil
+import stat
+import gc
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS, Chroma
+from langchain_qdrant import QdrantVectorStore
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -41,14 +45,30 @@ from flashrank import Ranker, RerankRequest
 # ---------------------------------------------------------------------------
 DOCS_DIR       = "docs"
 VECTOR_DB_ROOT = "vectorstore_index"
-EMBED_MODEL_FOLDER = "bge-small-en-v1.5"   # matches folder name inside models/
+ALL_MODELS     = ["bge-small-en-v1.5", "bge-large-en-v1.5", "all-MiniLM-L6-v2"]
+ALL_ENGINES    = ["FAISS", "Chroma", "Qdrant"]
+DEFAULT_EMBED_MODEL = "bge-small-en-v1.5"
+DEFAULT_ENGINE = "FAISS"
 CHUNK_SIZE     = 750
 CHUNK_OVERLAP  = 100
 
-VECTOR_DB_DIR = os.path.join(VECTOR_DB_ROOT, EMBED_MODEL_FOLDER, "faiss")
+# Module-level cache for loaded vectorstores — mirrors server.py's _cache pattern.
+# Persists across Streamlit reruns within the same process (not across separate users).
+_vs_cache = {}
+
+def get_isolated_paths(model_folder):
+    """Index folder paths for a given embedding model — one FAISS/Chroma/Qdrant
+    subfolder per model, since different models produce different-dimension vectors."""
+    base = os.path.join(VECTOR_DB_ROOT, model_folder)
+    return {
+        "faiss":       os.path.join(base, "faiss"),
+        "faiss_file":  os.path.join(base, "faiss", "index.faiss"),
+        "chroma":      os.path.join(base, "chroma"),
+        "chroma_file": os.path.join(base, "chroma", "chroma.sqlite3"),
+        "qdrant":      os.path.join(base, "qdrant"),
+    }
 
 os.makedirs(DOCS_DIR, exist_ok=True)
-os.makedirs(VECTOR_DB_DIR, exist_ok=True)
 
 GREETINGS = ["hi", "hello", "hey", "how are you", "good morning", "good evening"]
 FAREWELLS = ["bye", "goodbye", "exit", "quit", "see you", "take care", "thanks", "thank you"]
@@ -86,6 +106,9 @@ if "processing_files"  not in st.session_state: st.session_state.processing_file
 if "processing_doc"    not in st.session_state: st.session_state.processing_doc    = None
 if "last_rebuilt_time" not in st.session_state: st.session_state.last_rebuilt_time = None
 if "vectorstore"       not in st.session_state: st.session_state.vectorstore       = None
+if "vectorstore_embed_model" not in st.session_state: st.session_state.vectorstore_embed_model = None
+if "embed_model"       not in st.session_state: st.session_state.embed_model       = DEFAULT_EMBED_MODEL
+if "vector_engine"     not in st.session_state: st.session_state.vector_engine     = DEFAULT_ENGINE
 if "upload_toast"      not in st.session_state: st.session_state.upload_toast      = None
 if "delete_toast"      not in st.session_state: st.session_state.delete_toast      = None
 
@@ -111,13 +134,13 @@ def get_ollama_models():
 # Falls back to Hub namespace only if local folder missing.
 # ---------------------------------------------------------------------------
 @st.cache_resource
-def get_embeddings():
+def get_embeddings(embed_model_folder):
     try:
         import torch as _torch
         device = "cuda" if _torch.cuda.is_available() else "cpu"
     except Exception:
         device = "cpu"   # torch/CUDA check failed — fall back safely rather than crashing
-    local_path = os.path.join("models", EMBED_MODEL_FOLDER)
+    local_path = os.path.join("models", embed_model_folder)
     try:
         if os.path.exists(local_path):
             return HuggingFaceEmbeddings(
@@ -125,19 +148,16 @@ def get_embeddings():
                 model_kwargs={"device": device},
                 encode_kwargs={"batch_size": 8}
             )
-        namespace = f"BAAI/{EMBED_MODEL_FOLDER}" if "bge" in EMBED_MODEL_FOLDER \
-                    else f"sentence-transformers/{EMBED_MODEL_FOLDER}"
+        namespace = f"BAAI/{embed_model_folder}" if "bge" in embed_model_folder \
+                    else f"sentence-transformers/{embed_model_folder}"
         return HuggingFaceEmbeddings(
             model_name=namespace,
             model_kwargs={"device": device},
             encode_kwargs={"batch_size": 8}
         )
     except Exception as e:
-        st.error(f"Could not load embedding model: {e}. Check that models/{EMBED_MODEL_FOLDER} contains valid model files.")
+        st.error(f"Could not load embedding model: {e}. Check that models/{embed_model_folder} contains valid model files.")
         raise
-
-def index_exists():
-    return os.path.exists(os.path.join(VECTOR_DB_DIR, "index.faiss"))
 
 def load_and_chunk_documents():
     """Ported exactly from server.py's load_and_chunk_documents() — skips hidden/Mac files, skips unreadable files (e.g. password-protected PDFs, corrupted files) and reports which ones."""
@@ -162,40 +182,116 @@ def load_and_chunk_documents():
             skipped.append(fname)   # unreadable — password-protected, corrupted, or unsupported encoding
     return chunks, skipped
 
-def rebuild_index():
-    """Rebuild FAISS index from all docs in DOCS_DIR. Returns True on success, False if no docs (matches server.py's rebuild_all_indexes contract)."""
+def force_remove(path):
+    """Delete folder even if files are read-only (handles Windows permission errors) — ported from server.py."""
+    def handle_error(func, fpath, exc_info):
+        try:
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        except Exception:
+            pass
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=handle_error)
+
+def clear_vectorstore_cache():
+    """Release all cached vectorstore objects and flush DB connection pools before rebuilding —
+    ported from server.py exactly. Must run before rebuild or Qdrant/Chroma throw file-lock errors:
+    Qdrant holds an OS-level exclusive lock on its folder, Chroma holds a class-level SQLite pool."""
+    for key in list(_vs_cache.keys()):
+        store = _vs_cache.get(key)
+        if store is not None:
+            try:
+                if hasattr(store, "_client"):
+                    store._client.close()
+            except Exception:
+                pass
+            _vs_cache[key] = None
+    try:
+        import chromadb
+        chromadb.api.client.SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+def _build_indexes_for_model(model_folder, embeddings, chunks):
+    """Build FAISS, Chroma, and Qdrant indexes for one embedding model — ported from server.py."""
+    paths = get_isolated_paths(model_folder)
+    force_remove(paths["faiss"])
+    force_remove(paths["chroma"])
+    force_remove(paths["qdrant"])
+    os.makedirs(paths["faiss"], exist_ok=True)
+    os.makedirs(paths["chroma"], exist_ok=True)
+    os.makedirs(paths["qdrant"], exist_ok=True)
+    try:
+        FAISS.from_documents(chunks, embeddings).save_local(paths["faiss"])
+    except Exception as e:
+        raise RuntimeError(f"FAISS build failed for {model_folder}: {e}") from e
+    try:
+        Chroma.from_documents(chunks, embeddings, persist_directory=paths["chroma"])
+    except Exception as e:
+        raise RuntimeError(f"Chroma build failed for {model_folder}: {e}") from e
+    try:
+        QdrantVectorStore.from_documents(chunks, embeddings, path=paths["qdrant"], collection_name="rag_docs")
+    except Exception as e:
+        raise RuntimeError(f"Qdrant build failed for {model_folder}: {e}") from e
+
+def rebuild_all_indexes():
+    """Rebuild FAISS + Chroma + Qdrant indexes for ALL three embedding models — ported from
+    server.py exactly. One longer wait upfront means every model/engine combination is instantly
+    available afterward with zero rebuild needed when the user switches dropdowns.
+    Returns False if no documents found."""
+    clear_vectorstore_cache()
     chunks, skipped = load_and_chunk_documents()
     if skipped:
         st.warning(f"Could not read {len(skipped)} file(s): {', '.join(skipped)} — may be password-protected, corrupted, or contain no extractable text.")
     if not chunks:
-        # no docs left — wipe stale index so nothing stale can be queried (last-doc-delete bug fix from VEDA)
-        import shutil
-        shutil.rmtree(VECTOR_DB_DIR, ignore_errors=True)
-        os.makedirs(VECTOR_DB_DIR, exist_ok=True)
+        # no docs left — wipe all indexes so stale data cannot be queried
+        for model in ALL_MODELS:
+            p = get_isolated_paths(model)
+            for folder in [p["faiss"], p["chroma"], p["qdrant"]]:
+                if os.path.exists(folder):
+                    shutil.rmtree(folder, ignore_errors=True)
         st.session_state.vectorstore = None
         return False
-    embeddings = get_embeddings()
-    vs = FAISS.from_documents(chunks, embeddings)
-    vs.save_local(VECTOR_DB_DIR)
-    st.session_state.vectorstore = vs
+    for model in ALL_MODELS:
+        embeddings = get_embeddings(model)
+        _build_indexes_for_model(model, embeddings, chunks)
     return True
 
-def load_vectorstore():
-    if st.session_state.vectorstore is not None:
-        return st.session_state.vectorstore
-    if index_exists():
-        try:
-            embeddings = get_embeddings()
-            vs = FAISS.load_local(VECTOR_DB_DIR, embeddings, allow_dangerous_deserialization=True)
-            st.session_state.vectorstore = vs
-            return vs
-        except Exception as e:
-            st.error(f"Saved index appears corrupted ({e}). Wiping it — please re-upload documents and rebuild.")
-            import shutil
-            shutil.rmtree(VECTOR_DB_DIR, ignore_errors=True)
-            os.makedirs(VECTOR_DB_DIR, exist_ok=True)
-            return None
-    return None
+def all_indexes_exist():
+    """Check that indexes for all three embedding models (all engines) exist on disk."""
+    try:
+        for m in ALL_MODELS:
+            p = get_isolated_paths(m)
+            if not os.path.exists(p["faiss_file"]): return False
+            if not os.path.exists(p["chroma_file"]): return False
+            if not os.path.exists(p["qdrant"]) or len(os.listdir(p["qdrant"])) == 0: return False
+        return True
+    except Exception:
+        return False
+
+def load_vectorstore(engine, model_folder):
+    """Load vectorstore from disk, caching it so repeated dropdown switches don't reload from disk
+    every time — ported from server.py's load_vectorstore() exactly."""
+    key = f"vectorstore_{engine}_{model_folder}"
+    if _vs_cache.get(key) is not None:
+        return _vs_cache[key]
+    paths = get_isolated_paths(model_folder)
+    embeddings = get_embeddings(model_folder)
+    try:
+        if engine == "FAISS":
+            store = FAISS.load_local(paths["faiss"], embeddings, allow_dangerous_deserialization=True)
+        elif engine == "Chroma":
+            store = Chroma(persist_directory=paths["chroma"], embedding_function=embeddings)
+        else:
+            from qdrant_client import QdrantClient as _QdrantClient
+            _client = _QdrantClient(path=paths["qdrant"])
+            store = QdrantVectorStore(client=_client, collection_name="rag_docs", embedding=embeddings)
+    except Exception as e:
+        st.error(f"Could not load {engine} index for {model_folder}: {e}. Click Rebuild.")
+        return None
+    _vs_cache[key] = store
+    return store
 
 # ---------------------------------------------------------------------------
 # LAYER 2 — MULTI-AGENT PIPELINE
@@ -242,7 +338,7 @@ def extract_sources(chunks):
             sources.append(f"{doc_name} (pg {page + 1})" if page is not None else doc_name)
     return sources
 
-def compute_grounding_score(claim_text, source_chunks):
+def compute_grounding_score(claim_text, source_chunks, embed_model_folder):
     """OBJECTIVE confidence signal — independent of the LLM's own self-grading.
     Embeds the claim text and each source chunk (reusing the already-loaded embedding
     model), measures cosine similarity, returns the best match. Low similarity here
@@ -251,7 +347,7 @@ def compute_grounding_score(claim_text, source_chunks):
     if not source_chunks:
         return 0.0
     try:
-        embeddings = get_embeddings()
+        embeddings = get_embeddings(embed_model_folder)
         claim_vec = np.array(embeddings.embed_query(claim_text))
         claim_norm = np.linalg.norm(claim_vec)
         if claim_norm == 0:
@@ -296,7 +392,7 @@ Answer:"""
     draft = chain.invoke({"context": context, "question": question})
     return draft, chunks
 
-def run_verifier(vectorstore, draft_answer, model_name):
+def run_verifier(vectorstore, draft_answer, model_name, embed_model_folder):
     """Stage 2 — independently re-retrieves evidence for the draft's claims, checks support, scores confidence."""
     # Use the draft itself as the search query — an independent re-check, not reusing Researcher's chunks
     fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=15, top_n=7)
@@ -324,7 +420,7 @@ Verification:"""
     verification = chain.invoke({"evidence": fresh_context, "claim": draft_answer})
 
     # OBJECTIVE signal — independent of the LLM's self-grading above.
-    grounding_score = compute_grounding_score(draft_answer, fresh_chunks)
+    grounding_score = compute_grounding_score(draft_answer, fresh_chunks, embed_model_folder)
     if grounding_score is not None:
         verification += f"\n\n[Automated grounding check — embedding similarity between claim and evidence: {grounding_score:.2f}]"
 
@@ -489,6 +585,24 @@ with st.sidebar:
             disabled=st.session_state.generating
         )
 
+    # Only offer embedding models that actually have local weights downloaded
+    installed_embed_models = [m for m in ALL_MODELS if os.path.exists(os.path.join("models", m))]
+    if not installed_embed_models:
+        installed_embed_models = [DEFAULT_EMBED_MODEL]   # fallback — will attempt Hub download
+    embed_idx = installed_embed_models.index(st.session_state.embed_model) if st.session_state.embed_model in installed_embed_models else 0
+    st.session_state.embed_model = st.selectbox(
+        "Select Embedding Model", installed_embed_models, index=embed_idx,
+        disabled=st.session_state.generating,
+        help="All models are pre-built together on Rebuild — switching here is instant, no rebuild needed."
+    )
+
+    engine_idx = ALL_ENGINES.index(st.session_state.vector_engine) if st.session_state.vector_engine in ALL_ENGINES else 0
+    st.session_state.vector_engine = st.selectbox(
+        "Select Vector Engine", ALL_ENGINES, index=engine_idx,
+        disabled=st.session_state.generating,
+        help="FAISS = lowest latency. All engines are pre-built together on Rebuild."
+    )
+
     st.header("Document Management")
 
     with st.container(key="uploader_wrap"):
@@ -516,7 +630,7 @@ with st.sidebar:
     if st.session_state.force_rebuild:
         with st.spinner("Rebuilding index..."):
             try:
-                ok = rebuild_index()
+                ok = rebuild_all_indexes()
                 if ok:
                     st.session_state.just_rebuilt = True
                     st.session_state.last_rebuilt_time = time.time()
@@ -544,7 +658,7 @@ with st.sidebar:
             st.caption("Last rebuilt: 1 min ago")
         else:
             st.caption(f"Last rebuilt: {elapsed} mins ago")
-    elif not index_exists():
+    elif not all_indexes_exist():
         st.caption("No index found — upload documents and click Rebuild")
     else:
         st.caption("Last rebuilt: unknown — consider rebuilding")
@@ -583,7 +697,7 @@ if st.session_state.generating and st.session_state.processing_task == "upload":
             for fname, fbytes in files:
                 with open(os.path.join(DOCS_DIR, fname), "wb") as f:
                     f.write(fbytes)
-            ok = rebuild_index()
+            ok = rebuild_all_indexes()
     except Exception as e:
         st.error(f"Upload/rebuild failed: {e}")
     finally:
@@ -607,7 +721,7 @@ elif st.session_state.generating and st.session_state.processing_task == "delete
             fpath = os.path.join(DOCS_DIR, doc_name)
             if os.path.exists(fpath):
                 os.remove(fpath)
-            ok = rebuild_index()   # rebuild_index() itself wipes stale index if no docs remain
+            ok = rebuild_all_indexes()   # rebuild_all_indexes() itself wipes all stale indexes if no docs remain
     except Exception as e:
         st.error(f"Delete/rebuild failed: {e}")
     finally:
@@ -649,13 +763,16 @@ for message in st.session_state.messages:
             if message.get("guardrail_triggered"):
                 st.caption(
                     f"{message['latency']:.2f}s | LLM: {message['engine']} | "
+                    f"Embed: {message.get('embed', st.session_state.embed_model)} | "
+                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)} | FlashRank reranked | "
                     f"Correctly declined — no relevant information found"
                 )
             else:
                 conf_part = f" | Confidence: {message['confidence_str']}" if message.get("confidence_str") else ""
                 st.caption(
                     f"{message['latency']:.2f}s | LLM: {message['engine']} | "
-                    f"Embed: {message.get('embed', EMBED_MODEL_FOLDER)}{conf_part}"
+                    f"Embed: {message.get('embed', st.session_state.embed_model)} | "
+                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)}{conf_part}"
                 )
 
 # ---------------------------------------------------------------------------
@@ -691,7 +808,7 @@ if question:
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
             else:
-                vectorstore = load_vectorstore()
+                vectorstore = load_vectorstore(st.session_state.vector_engine, st.session_state.embed_model)
                 response_area = st.empty()
 
                 if vectorstore is None:
@@ -722,7 +839,7 @@ if question:
                             # Researcher's output, not each other — run them concurrently.
                             with st.status("Verifying claims + checking contradictions...", expanded=False) as status23:
                                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                                    future_verify = executor.submit(run_verifier, vectorstore, draft_answer, selected_model)
+                                    future_verify = executor.submit(run_verifier, vectorstore, draft_answer, selected_model, st.session_state.embed_model)
                                     future_contradict = executor.submit(run_contradiction_check, researcher_chunks[:5], selected_model)
                                     verification, verifier_chunks, grounding_score = future_verify.result()
                                     contradiction_report = future_contradict.result()
@@ -753,14 +870,15 @@ if question:
 
                         latency = time.time() - start
                         if guardrail_triggered:
-                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Correctly declined — no relevant information found")
+                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine} | FlashRank reranked | Correctly declined — no relevant information found")
                         else:
                             conf_part = f" | Confidence: {confidence_str}" if confidence_str else ""
-                            st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {EMBED_MODEL_FOLDER}{conf_part}")
+                            st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine}{conf_part}")
 
                         st.session_state.messages.append({
                             "role": "assistant", "content": final_answer,
-                            "latency": latency, "engine": selected_model, "embed": EMBED_MODEL_FOLDER,
+                            "latency": latency, "engine": selected_model, "embed": st.session_state.embed_model,
+                            "vector_engine": st.session_state.vector_engine,
                             "guardrail_triggered": guardrail_triggered,
                             "confidence_str": confidence_str,
                             "stages": {
