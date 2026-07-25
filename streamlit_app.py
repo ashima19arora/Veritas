@@ -28,6 +28,7 @@ import concurrent.futures
 import shutil
 import stat
 import gc
+import atexit
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -335,7 +336,10 @@ def extract_sources(chunks):
         key = (doc_name, page)
         if key not in seen:
             seen.add(key)
-            sources.append(f"{doc_name} (pg {page + 1})" if page is not None else doc_name)
+            try:
+                sources.append(f"{doc_name} (pg {int(page) + 1})" if page is not None else doc_name)
+            except (TypeError, ValueError):
+                sources.append(doc_name)   # page metadata wasn't a usable number — just show filename
     return sources
 
 def compute_grounding_score(claim_text, source_chunks, embed_model_folder):
@@ -395,7 +399,7 @@ Answer:"""
 def run_verifier(vectorstore, draft_answer, model_name, embed_model_folder):
     """Stage 2 — independently re-retrieves evidence for the draft's claims, checks support, scores confidence."""
     # Use the draft itself as the search query — an independent re-check, not reusing Researcher's chunks
-    fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=15, top_n=7)
+    fresh_chunks = retrieve_chunks(vectorstore, draft_answer, k=10, top_n=7)
     fresh_context = "\n\n---\n\n".join([c.page_content for c in fresh_chunks])
 
     prompt_template = """You are an expert fact-verifier and proofreader. You did NOT write the claim below — your job is to independently check it.
@@ -420,7 +424,7 @@ Verification:"""
     verification = chain.invoke({"evidence": fresh_context, "claim": draft_answer})
 
     # OBJECTIVE signal — independent of the LLM's self-grading above.
-    grounding_score = compute_grounding_score(draft_answer, fresh_chunks, embed_model_folder)
+    grounding_score = compute_grounding_score(draft_answer, fresh_chunks[:3], embed_model_folder)
     if grounding_score is not None:
         verification += f"\n\n[Automated grounding check — embedding similarity between claim and evidence: {grounding_score:.2f}]"
 
@@ -670,7 +674,8 @@ col1, col2 = st.columns([4, 1.5])
 with col1:
     st.title("VERITAS")
     st.markdown(
-        '<div class="system-caption">Secure offline multi-agent research system powered by Ollama</div>',
+        f'<div class="system-caption">Secure Offline Multi-Agent Research System — {selected_model} | '
+        f'Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine} | FlashRank</div>',
         unsafe_allow_html=True
     )
 with col2:
@@ -764,15 +769,15 @@ for message in st.session_state.messages:
                 st.caption(
                     f"{message['latency']:.2f}s | LLM: {message['engine']} | "
                     f"Embed: {message.get('embed', st.session_state.embed_model)} | "
-                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)} | FlashRank reranked | "
+                    f"Engine: {message.get("vector_engine", st.session_state.vector_engine)} + FlashRank | "
                     f"Correctly declined — no relevant information found"
                 )
             else:
                 conf_part = f" | Confidence: {message['confidence_str']}" if message.get("confidence_str") else ""
                 st.caption(
                     f"{message['latency']:.2f}s | LLM: {message['engine']} | "
-                    f"Embed: {message.get('embed', st.session_state.embed_model)} | "
-                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)}{conf_part}"
+                    f"Engine: {message.get('vector_engine', st.session_state.vector_engine)} | "
+                    f"Embed: {message.get('embed', st.session_state.embed_model)} + FlashRank{conf_part}"
                 )
 
 # ---------------------------------------------------------------------------
@@ -870,10 +875,10 @@ if question:
 
                         latency = time.time() - start
                         if guardrail_triggered:
-                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine} | FlashRank reranked | Correctly declined — no relevant information found")
+                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine} + FlashRank | Correctly declined — no relevant information found")
                         else:
                             conf_part = f" | Confidence: {confidence_str}" if confidence_str else ""
-                            st.caption(f"{latency:.2f}s total | LLM: {selected_model} | 4-stage pipeline | Embed: {st.session_state.embed_model} | Engine: {st.session_state.vector_engine}{conf_part}")
+                            st.caption(f"{latency:.2f}s | LLM: {selected_model} | Engine: {st.session_state.vector_engine} | Embed: {st.session_state.embed_model} + FlashRank{conf_part}")
 
                         st.session_state.messages.append({
                             "role": "assistant", "content": final_answer,
@@ -896,3 +901,12 @@ if question:
 
                     finally:
                         st.session_state.generating = False
+
+# ---------------------------------------------------------------------------
+# CLEANUP — ported exactly from server.py. Releases Qdrant/Chroma locks on
+# process shutdown so a killed/restarted app doesn't leave a stale lock behind.
+# ---------------------------------------------------------------------------
+def _cleanup():
+    clear_vectorstore_cache()
+
+atexit.register(_cleanup)
